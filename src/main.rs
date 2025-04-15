@@ -2,20 +2,18 @@ use std::collections::HashMap;
 use std::fmt;
 use std::iter::Peekable;
 
-// TODO: how are we gonna apply intrinsics?
-//      for items of the state? for state? which state and whcih items?
-//      are indentations for intrinsics matter?
+// TODO: change all panics to normal error messages
+// FIXME: opt after newline doesn't define new state
+// FIXME: indented intrinsic defines new state
+
 const TEST_CONVO: &str = "
-- aboba
+@lbl ABOBA
+- aslkdj
 
-- suka #00 blyad
-    - Yeah. #11
+    @lbl SUKA
+    - hello
+    > opt
 
-    @lbl Suka
-    - wowawaaw #13
-    > blyad
-        - blyad reply
-- Hello #14
     - suka
 ";
 
@@ -32,15 +30,15 @@ impl fmt::Display for StateId {
 }
 
 #[derive(Default, Debug, Clone)]
-enum StateRef {
-    Label(String),
+enum StateRef<'s> {
+    Label(&'s str),
     Id(StateId),
     FromOption,
     #[default]
     End,
 }
 
-impl fmt::Display for StateRef {
+impl fmt::Display for StateRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             StateRef::Id(id) => write!(f, "{id}"),
@@ -49,37 +47,47 @@ impl fmt::Display for StateRef {
     }
 }
 
-struct Conversation {
+struct Conversation<'s> {
     indentation: Indentation,
-    states: HashMap<StateId, State>,
-    // labels: HashMap<&'s str, StateId>,
+    states: HashMap<StateId, State<'s>>,
+    labels_map: LabelsMap<'s>,
 }
 
-impl fmt::Display for Conversation {
+impl fmt::Display for Conversation<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut sorted = self.states.iter().collect::<Vec<_>>();
         sorted.sort_by(|(id, _), (oid, _)| id.idx.cmp(&oid.idx));
 
-        let single_indent = match self.indentation {
-            Indentation::Spaces(n) => ' '.to_string().repeat(n as _),
-            Indentation::Tabs(n) => '\t'.to_string().repeat(n as _),
+        let make_indent = |depth: u32| {
+            let mut it = String::new();
+            if depth == 0 {
+                return it;
+            }
+
+            let (ch, n) = match self.indentation {
+                Indentation::Spaces(n) => (' ', n * depth),
+                Indentation::Tabs(n) => ('\t', n * depth),
+            };
+
+            it.reserve(n as _);
+            for _ in 0..n {
+                it.push(ch);
+            }
+
+            it
         };
 
         for (id, state) in sorted {
-            let indent = if id.depth == 0 {
-                String::new()
-            } else {
-                single_indent.repeat(id.depth as _)
-            };
-
-            writeln!(f, "{indent}({id}) => ({})", state.next_state)?;
+            let indent = make_indent(id.depth);
+            let label = self.labels_map.ids_to_labels.get(id).unwrap_or(&"");
+            writeln!(f, "{indent}({label}) [{id}] => [{}] ", state.next_state)?;
 
             for rp in &state.response_phrases {
                 writeln!(f, "{indent}- {rp:?}")?;
             }
 
             for o in &state.options {
-                writeln!(f, "{indent}> {:?} => ({})", o.text, o.next_state)?;
+                writeln!(f, "{indent}> {:?} => [{}]", o.text, o.next_state)?;
             }
 
             writeln!(f)?;
@@ -89,31 +97,25 @@ impl fmt::Display for Conversation {
     }
 }
 
-// phrases are heap allocated because they may be multi-line and we need to get read of indentation:
+// phrases are heap allocated because they may be multi-line and we need to get rid of indentation:
 // - some multi-line
 //      phrase right here
 //      will preserve newlines
 //      <- but will remove this indentations
 #[derive(Default, Debug, Clone)]
-struct State {
+struct State<'s> {
     response_phrases: Vec<String>,
-    options: Vec<YourOption>,
-    // if this is None then get next state from option
-    // if no options, so the conversation is finished
-    next_state: StateRef,
+    options: Vec<YourOption<'s>>,
+    next_state: StateRef<'s>,
 }
 
 #[derive(Default, Clone, Debug)]
-struct YourOption {
+struct YourOption<'s> {
     text: String,
-    next_state: StateRef,
+    next_state: StateRef<'s>,
 }
 
-impl State {
-    fn is_empty(&self) -> bool {
-        self.response_phrases.is_empty() && self.options.is_empty()
-    }
-
+impl<'s> State<'s> {
     fn merge_with(&mut self, mut other: Self) {
         for p in other.response_phrases.drain(..) {
             self.response_phrases.push(p)
@@ -178,7 +180,7 @@ struct Loc {
 
 #[derive(Debug)]
 enum Intrinsic<'s> {
-    DefineLabel(&'s str),
+    Label(&'s str),
 }
 
 fn collect_intrinsic<'s>(
@@ -186,8 +188,8 @@ fn collect_intrinsic<'s>(
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
 ) -> Option<Intrinsic<'s>> {
     match collect_word(src, stream)? {
-        "lbl" => collect_word(src, stream).map(Intrinsic::DefineLabel),
-        _ => panic!("unknown intrinsic"),
+        "lbl" => collect_word(src, stream).map(Intrinsic::Label),
+        word => panic!("unknown intrinsic: {word}"),
     }
 }
 
@@ -238,7 +240,10 @@ fn next_token<'s>(
         }
         '-' => {
             let _ = stream.next();
+            // let ph = collect_phrase(src, stream)?;
+            // println!("--- ph = {ph:?}");
             TokenKind::Response(collect_phrase(src, stream)?)
+            // TokenKind::Response(ph)
         }
         '\n' => {
             let _ = stream.next();
@@ -259,18 +264,17 @@ fn collect_word<'s>(
     src: &'s str,
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
 ) -> Option<&'s str> {
-    while stream.next_if(|t| t.1.is_whitespace()).is_some() {}
     let (word_start, _, _) = stream.peek().copied()?;
     let mut word_end: usize = word_start;
 
-    for (idx, ch, _) in stream {
+    for (idx, ch, _loc) in stream {
         if ch.is_whitespace() {
             break;
         }
         word_end = idx;
     }
 
-    src.get(word_start..=word_end)
+    src.get(word_start..=word_end).map(str::trim_start)
 }
 
 fn collect_phrase<'s>(
@@ -280,6 +284,8 @@ fn collect_phrase<'s>(
     let (phrase_start, _, _) = stream.peek().copied()?;
     let mut phrase_end: usize = phrase_start;
 
+    // NOTE: End is not trimmed, because the phrases may be combined in the future: Response/Option + PhraseContinuation
+    //       So the result Option or Response in the state will most likely contains a newline, which will be removed on parsing stage
     for (idx, ch, _loc) in stream {
         phrase_end = idx;
         if ch == '\n' {
@@ -287,9 +293,7 @@ fn collect_phrase<'s>(
         }
     }
 
-    // NOTE: End is not trimmed, because the phrases may be combined in the future: Response/Option + PhraseContinuation
-    //       So the result Option or Response in the state will most likely contains a newline
-    Some(src[phrase_start..=phrase_end].trim_start())
+    src.get(phrase_start..=phrase_end).map(str::trim_start)
 }
 
 fn collect_indent(
@@ -317,12 +321,16 @@ fn collect_indent(
     }
 }
 
-fn parse_unlinked_states(tokens: &[Token]) -> (Indentation, Vec<(StateId, State)>) {
-    enum Collecting {
-        Responses,
-        Options,
-    }
+#[derive(Debug)]
+enum ParseOp {
+    State(StateId),
+    Response(String),
+    Option(String),
+}
 
+fn parse_tokens_into_operations<'s>(
+    tokens: Vec<Token<'s>>,
+) -> (Indentation, Vec<ParseOp>, Vec<(Intrinsic<'s>, StateId)>) {
     fn try_get_indent_depth(input: Indentation, single: Indentation, loc: Loc) -> u32 {
         if input.is_empty() {
             return 0;
@@ -352,25 +360,81 @@ fn parse_unlinked_states(tokens: &[Token]) -> (Indentation, Vec<(StateId, State)
     }
 
     let mut single_indent: Option<Indentation> = None;
-    let mut current_depth = 0;
+    let mut state_id = StateId::default();
+    let mut ops = Vec::new();
+    let mut int_stack = Vec::new();
 
-    let mut token_is_on_other_depth = |token: &Token, state_id: &mut StateId| -> bool {
-        if single_indent.is_none() && !token.indentation.is_empty() {
-            let _ = single_indent.insert(token.indentation);
+    macro_rules! op_def_state {
+        () => {{
+            // NOTE: first state is defined by default in the `parse_operations_into_unlinked_states`
+            state_id.idx += 1;
+            ops.push(ParseOp::State(state_id));
+        }};
+    }
+
+    for token in tokens {
+        macro_rules! process_indent {
+            () => {{
+                if single_indent.is_none() && !token.indentation.is_empty() {
+                    let _ = single_indent.insert(token.indentation);
+                }
+
+                let current_depth = state_id.depth;
+                if let Some(single) = single_indent {
+                    state_id.depth = try_get_indent_depth(token.indentation, single, token.indentation_loc);
+                }
+
+                if current_depth != state_id.depth {
+                    // modify State op, pushed by SpaceLine token, which doesn't have indentation info
+                    // TODO: skip intrinsics and find
+                    if let Some(ParseOp::State(id)) = ops.last_mut() {
+                        id.depth = state_id.depth;
+                    } else {
+                        op_def_state!();
+                    }
+                }
+            }}
         }
 
-        if let Some(single) = single_indent {
-            let new_depth = try_get_indent_depth(token.indentation, single, token.indentation_loc);
-            state_id.depth = current_depth;
-            current_depth = new_depth;
+        match token.kind {
+            TokenKind::SpaceLine => {
+                if !matches!(ops.last(), Some(ParseOp::State(_))) {
+                    op_def_state!();
+                }
+            }
+            TokenKind::Intrinsic(int) => {
+                process_indent!();
+                int_stack.push((int, state_id));
+            }
+            TokenKind::PhraseContinuation(phrase) => match ops.last_mut() {
+                Some(ParseOp::Response(ph)) => ph.push_str(phrase),
+                Some(ParseOp::Option(o)) => o.push_str(phrase),
+                _ => panic!("lonely lost phrase is not allowed: {phrase}"),
+            },
+            TokenKind::Response(phrase) => {
+                process_indent!();
+                ops.push(ParseOp::Response(phrase.to_string()));
+            }
+            TokenKind::Option(phrase) => {
+                process_indent!();
+                ops.push(ParseOp::Option(phrase.to_string()));
+            }
         }
+    }
 
-        current_depth != state_id.depth
-    };
+    (
+        single_indent.unwrap_or_else(Indentation::empty),
+        ops,
+        int_stack,
+    )
+}
 
-    let mut collecting = Collecting::Responses;
-    let mut token_stream = tokens.iter().peekable();
+struct LabelsMap<'s> {
+    labels_to_ids: HashMap<&'s str, StateId>,
+    ids_to_labels: HashMap<StateId, &'s str>,
+}
 
+fn parse_operations_into_unlinked_states<'s>(ops: Vec<ParseOp>) -> Vec<(StateId, State<'s>)> {
     // - chunk 1 => state 1
     //     - chunk 2 => state 2
     //     - chunk 2 => state 2
@@ -383,65 +447,19 @@ fn parse_unlinked_states(tokens: &[Token]) -> (Indentation, Vec<(StateId, State)
     // - chunk 5 => state 4
     // > chunk 5 => state 4
 
-    let mut state_id = StateId::default();
-    let mut chunk = State::default();
-    let mut chunks = Vec::<(StateId, State)>::new();
+    let mut chunks = vec![(StateId::default(), State::default())];
 
-    macro_rules! push_chunk {
-        ($( $cf:ident )?) => {{
-            chunks.push((state_id, chunk.clone()));
-            state_id.idx += 1;
-            chunk.response_phrases.clear();
-            chunk.options.clear();
-
-
-            $(
-                collecting = Collecting::Responses;
-                $cf
-            )?
-        }};
-    }
-
-    while let Some(token) = token_stream.peek() {
-        match &token.kind {
-            TokenKind::Intrinsic(_int) => {
-                // "TODO: apply intrinsic or better store it for later stages of parsing"
+    for op in ops {
+        match op {
+            ParseOp::State(id) => chunks.push((id, State::default())),
+            ParseOp::Response(phrase) => {
+                chunks.last_mut().unwrap().1.response_phrases.push(phrase)
             }
-            TokenKind::SpaceLine => {
-                if let Collecting::Responses = collecting {
-                    push_chunk!()
-                }
-            }
-            TokenKind::PhraseContinuation(phrase) => match collecting {
-                Collecting::Responses => {
-                    chunk.response_phrases.last_mut().unwrap().push_str(phrase)
-                }
-                Collecting::Options => chunk.options.last_mut().unwrap().text.push_str(phrase),
-            },
-            _ if token_is_on_other_depth(token, &mut state_id) => {
-                push_chunk!(continue);
-            }
-            TokenKind::Response(phrase) => match collecting {
-                Collecting::Responses => chunk.response_phrases.push(phrase.to_string()),
-                Collecting::Options => push_chunk!(continue),
-            },
-            TokenKind::Option(phrase) => match collecting {
-                Collecting::Responses => {
-                    collecting = Collecting::Options;
-                    continue;
-                }
-                Collecting::Options => chunk.options.push(YourOption {
-                    text: phrase.to_string(),
-                    next_state: StateRef::End,
-                }),
-            },
+            ParseOp::Option(text) => chunks.last_mut().unwrap().1.options.push(YourOption {
+                text,
+                next_state: StateRef::default(),
+            }),
         }
-
-        let _ = token_stream.next();
-    }
-
-    if !chunk.is_empty() {
-        push_chunk!();
     }
 
     // merge chunks of the same state
@@ -450,6 +468,15 @@ fn parse_unlinked_states(tokens: &[Token]) -> (Indentation, Vec<(StateId, State)
     let mut chunks = chunks.into_iter().peekable();
 
     while let Some((id, mut chunk)) = chunks.next() {
+        // trim newlines at the end of the phrases that we left on tokenization
+        for phrase in &mut chunk.response_phrases {
+            trim_end(phrase);
+        }
+
+        for op in &mut chunk.options {
+            trim_end(&mut op.text);
+        }
+
         while let Some((_, ochunk)) =
             chunks.next_if(|(oi, os)| oi.depth == id.depth && os.response_phrases.is_empty())
         {
@@ -459,12 +486,11 @@ fn parse_unlinked_states(tokens: &[Token]) -> (Indentation, Vec<(StateId, State)
         states.push((id, chunk));
     }
 
-    // returning unordered states
-    (single_indent.unwrap_or_else(Indentation::empty), states)
+    states
 }
 
-// this sets all 'next_state' fields
-fn link_states(states: Vec<(StateId, State)>) -> HashMap<StateId, State> {
+// linking means each state and option knows what is the next state
+fn link_conversation_states(states: Vec<(StateId, State)>) -> HashMap<StateId, State> {
     // let mut labels = HashMap::<String, StateId>::new();
     let mut linked_states = HashMap::from_iter(states.clone());
 
@@ -528,21 +554,77 @@ fn link_states(states: Vec<(StateId, State)>) -> HashMap<StateId, State> {
         let s = linked_states.get_mut(&id).unwrap();
         s.options = state.options;
         s.next_state = StateRef::FromOption;
-        assert!(!s.options.is_empty());
     }
 
     linked_states
 }
 
+fn apply_intrinsics<'s>(
+    intrinsics_call_stack: Vec<(Intrinsic<'s>, StateId)>,
+    _states: &mut HashMap<StateId, State>,
+) -> LabelsMap<'s> {
+    let mut labels_to_ids = HashMap::<&str, StateId>::new();
+    let mut ids_to_labels = HashMap::<StateId, &str>::new();
+
+    for (int, id) in intrinsics_call_stack {
+        match int {
+            Intrinsic::Label(lbl) => {
+                if lbl.is_empty() {
+                    panic!("empty label");
+                }
+
+                // TODO: normal errors
+                assert!(
+                    labels_to_ids.insert(lbl, id).is_none(),
+                    "duplicate label {lbl:?}"
+                );
+                assert!(
+                    ids_to_labels.insert(id, lbl).is_none(),
+                    "only one label allowed"
+                );
+            }
+        }
+    }
+
+    LabelsMap {
+        labels_to_ids,
+        ids_to_labels,
+    }
+}
+
+fn trim_end(s: &mut String) {
+    if let Some(end_idx) = s.rfind(|c: char| !c.is_whitespace()) {
+        s.truncate(end_idx + 1);
+    } else {
+        s.clear();
+    }
+
+    // trim start
+    // if let Some(start_idx) = s.find(|c: char| !c.is_whitespace()) {
+    //     let _ = s.drain(..start_idx);
+    // }
+}
+
 fn main() {
     let tokens = tokenize(TEST_CONVO);
-    let (indentation, unlinked_states) = parse_unlinked_states(&tokens);
-    let states = link_states(unlinked_states);
+    // println!("{:#?}", tokens);
+    // println!("--------------------------");
+    let (indentation, ops, intrinsics_call_stack) = parse_tokens_into_operations(tokens);
+    // println!("{:?}\n{:#?}", indentation, ops);
+    let unlinked_states = parse_operations_into_unlinked_states(ops);
+    let mut states = link_conversation_states(unlinked_states);
+    let labels_map = apply_intrinsics(intrinsics_call_stack, &mut states);
+    // println!("--------------------------");
+    // println!("{:#?}", unlinked_states);
 
     let convo = Conversation {
         indentation,
         states,
+        labels_map,
     };
 
+    println!("--------------------------");
     println!("{}", convo);
+    println!("--------------------------");
+    println!("{}", TEST_CONVO);
 }
