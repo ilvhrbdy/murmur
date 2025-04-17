@@ -62,7 +62,7 @@ In here `state [num]` is just an id of state, the logic of conversation is defin
 > I am not talking to you.          // state 1, option 2, will lead to 'End'
 
 
-> End                               // state 4, containing only option, defined by two newlines
+> End                               // state 4, containing only option, defined by two empty lines
 ```
 
 phrases support newlines: this is one phrase and one option, newline will be included, but the indentation is not:
