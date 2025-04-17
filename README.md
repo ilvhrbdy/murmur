@@ -1,7 +1,7 @@
 # WIP
 Not ready at all. Building it only for my own needs, so it is never going to be general purpose, instead use [Yarn Spinner](https://www.yarnspinner.dev/).
 
-## Features:
+## Future features:
 - Game engine agnostic: written as library, easily integrated with any engine, or even without engine by using IO with terminal.
 - Non-bloated: not a programming language, but can be manipulated with any programming language through API.
 - Generates and consumes csv to be able to easily write dialogues translations.
@@ -27,11 +27,12 @@ This is one state with two response phrases:
 - Please, go away!
 ```
 
-But this is two states separated by empty line:
+You can separate two responses into two different states by using two empty lines:
 ```
-- First state phrase.
+- First state. 
 
-- Next state phrase. 
+
+- Next state. 
 ```
 
 Also you start a new state when defining a response after options:
@@ -61,7 +62,7 @@ In here `state [num]` is just an id of state, the logic of conversation is defin
 > I am not talking to you.          // state 1, option 2, will lead to 'End'
 
 
-- End.
+> End                               // state 4, containing only option, defined by two newlines
 ```
 
 phrases support newlines: this is one phrase and one option, newline will be included, but the indentation is not:

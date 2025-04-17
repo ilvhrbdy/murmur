@@ -2,19 +2,27 @@ use std::collections::HashMap;
 use std::fmt;
 use std::iter::Peekable;
 
+// TODO: do i allow empty responses or options?
 // TODO: change all panics to normal error messages
-// FIXME: opt after newline doesn't define new state
-// FIXME: indented intrinsic defines new state
+// TODO: intrinsic '@include file' will create a namespace 'file'
+//      to refer a label inside of include use '.': 'file.label'
+//      means i will need to create a namespace for the current file like 'main.label' or use the filename
+//      so all the labels will be heap allocated
+//      this means i can drop the source after parsing
+//      which means i need to validate all '@jump label' before returning parsed Conversation
 
 const TEST_CONVO: &str = "
-@lbl ABOBA
+
 - aslkdj
-
-    @lbl SUKA
+@lbl suka
     - hello
-    > opt
 
+
+    > opt
     - suka
+
+
+> >
 ";
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy, Default)]
@@ -45,6 +53,11 @@ impl fmt::Display for StateRef<'_> {
             _ => write!(f, "{self:?}"),
         }
     }
+}
+
+struct LabelsMap<'s> {
+    labels_to_ids: HashMap<&'s str, StateId>,
+    ids_to_labels: HashMap<StateId, &'s str>,
 }
 
 struct Conversation<'s> {
@@ -87,7 +100,16 @@ impl fmt::Display for Conversation<'_> {
             }
 
             for o in &state.options {
-                writeln!(f, "{indent}> {:?} => [{}]", o.text, o.next_state)?;
+                let next_state_label = match &o.next_state {
+                    StateRef::Label(name) => name,
+                    StateRef::Id(ns_id) => self.labels_map.ids_to_labels.get(ns_id).unwrap_or(&""),
+                    _ => &"",
+                };
+                writeln!(
+                    f,
+                    "{indent}> {:?} => ({next_state_label}) [{}]",
+                    o.text, o.next_state
+                )?;
             }
 
             writeln!(f)?;
@@ -97,11 +119,6 @@ impl fmt::Display for Conversation<'_> {
     }
 }
 
-// phrases are heap allocated because they may be multi-line and we need to get rid of indentation:
-// - some multi-line
-//      phrase right here
-//      will preserve newlines
-//      <- but will remove this indentations
 #[derive(Default, Debug, Clone)]
 struct State<'s> {
     response_phrases: Vec<String>,
@@ -240,10 +257,7 @@ fn next_token<'s>(
         }
         '-' => {
             let _ = stream.next();
-            // let ph = collect_phrase(src, stream)?;
-            // println!("--- ph = {ph:?}");
             TokenKind::Response(collect_phrase(src, stream)?)
-            // TokenKind::Response(ph)
         }
         '\n' => {
             let _ = stream.next();
@@ -322,15 +336,32 @@ fn collect_indent(
 }
 
 #[derive(Debug)]
-enum ParseOp {
-    State(StateId),
-    Response(String),
-    Option(String),
+enum ParseOp<'s> {
+    DefState {
+        // strong is defined by two newlines
+        // strong state that contains only options will not be merged with previous on the same depth:
+        // - state 1
+        //      - state 2
+        //
+        //
+        // > state 3, defined by two newlines
+        //
+        // but:
+        //
+        // - state 1
+        //      - state 2
+        // > opt of state 1
+        strong: bool,
+        id: StateId,
+    },
+    PushResponse(String),
+    PushOption(String),
+    ApplyIntrinsic(Intrinsic<'s>),
 }
 
 fn parse_tokens_into_operations<'s>(
     tokens: Vec<Token<'s>>,
-) -> (Indentation, Vec<ParseOp>, Vec<(Intrinsic<'s>, StateId)>) {
+) -> (Indentation, Vec<ParseOp<'s>>) {
     fn try_get_indent_depth(input: Indentation, single: Indentation, loc: Loc) -> u32 {
         if input.is_empty() {
             return 0;
@@ -361,63 +392,89 @@ fn parse_tokens_into_operations<'s>(
 
     let mut single_indent: Option<Indentation> = None;
     let mut state_id = StateId::default();
-    let mut ops = Vec::new();
-    let mut int_stack = Vec::new();
+    let mut ops = vec![ParseOp::DefState {
+        strong: true,
+        id: state_id,
+    }];
 
-    macro_rules! op_def_state {
+    macro_rules! ops_push_def_state {
+        (strong) => {{
+            ops_push_def_state!(true);
+        }};
         () => {{
-            // NOTE: first state is defined by default in the `parse_operations_into_unlinked_states`
-            state_id.idx += 1;
-            ops.push(ParseOp::State(state_id));
+            ops_push_def_state!(false);
+        }};
+        ($kind:expr) => {{
+            // never define state twice
+            if !matches!(ops.last(), Some(ParseOp::DefState { .. })) {
+                state_id.idx += 1;
+                ops.push(ParseOp::DefState {
+                    id: state_id,
+                    strong: $kind,
+                });
+            }
         }};
     }
 
-    for token in tokens {
-        macro_rules! process_indent {
-            () => {{
-                if single_indent.is_none() && !token.indentation.is_empty() {
-                    let _ = single_indent.insert(token.indentation);
-                }
+    macro_rules! last_mut_op {
+        () => {{
+            ops.iter_mut().rev().find(|o| !matches!(o, ParseOp::ApplyIntrinsic(_)))
+        }}
+    }
 
-                let current_depth = state_id.depth;
-                if let Some(single) = single_indent {
-                    state_id.depth = try_get_indent_depth(token.indentation, single, token.indentation_loc);
-                }
+    // macro will compare indentations and will define a new state if they are differs
+    macro_rules! process_indent {
+        ($token:ident) => {{
+            if single_indent.is_none() && !$token.indentation.is_empty() {
+                single_indent = Some($token.indentation);
+            }
 
-                if current_depth != state_id.depth {
-                    // modify State op, pushed by SpaceLine token, which doesn't have indentation info
-                    // TODO: skip intrinsics and find
-                    if let Some(ParseOp::State(id)) = ops.last_mut() {
-                        id.depth = state_id.depth;
-                    } else {
-                        op_def_state!();
-                    }
-                }
-            }}
-        }
+            let current_depth = state_id.depth;
+            if let Some(single) = single_indent {
+                state_id.depth =
+                    try_get_indent_depth($token.indentation, single, $token.indentation_loc);
+            }
 
+            if current_depth != state_id.depth {
+                // modify State op, pushed by SpaceLine token, which doesn't have indentation info
+                if let Some(ParseOp::DefState { id, .. }) = last_mut_op!() {
+                    id.depth = state_id.depth;
+                } else {
+                    ops_push_def_state!();
+                }
+            }
+        }};
+    }
+
+    let mut tokens = tokens.into_iter().peekable();
+    while let Some(token) = tokens.next() {
         match token.kind {
-            TokenKind::SpaceLine => {
-                if !matches!(ops.last(), Some(ParseOp::State(_))) {
-                    op_def_state!();
-                }
-            }
             TokenKind::Intrinsic(int) => {
-                process_indent!();
-                int_stack.push((int, state_id));
+                ops.push(ParseOp::ApplyIntrinsic(int));
             }
-            TokenKind::PhraseContinuation(phrase) => match ops.last_mut() {
-                Some(ParseOp::Response(ph)) => ph.push_str(phrase),
-                Some(ParseOp::Option(o)) => o.push_str(phrase),
-                _ => panic!("lonely lost phrase is not allowed: {phrase}"),
-            },
             TokenKind::Response(phrase) => {
-                process_indent!();
-                ops.push(ParseOp::Response(phrase.to_string()));
+                if !matches!(last_mut_op!(), Some(ParseOp::PushResponse(_))) {
+                    ops_push_def_state!();
+                }
+                process_indent!(token);
+                ops.push(ParseOp::PushResponse(phrase.to_string()));
             }
             TokenKind::Option(phrase) => {
-                process_indent!();
-                ops.push(ParseOp::Option(phrase.to_string()));
+                process_indent!(token);
+                ops.push(ParseOp::PushOption(phrase.to_string()));
+            }
+            TokenKind::PhraseContinuation(phrase) => match last_mut_op!() {
+                Some(ParseOp::PushResponse(ph)) => ph.push_str(phrase),
+                Some(ParseOp::PushOption(o)) => o.push_str(phrase),
+                _ => panic!("lonely lost phrase is not allowed: {phrase}"),
+            },
+            TokenKind::SpaceLine => {
+                if tokens
+                    .next_if(|t| matches!(t.kind, TokenKind::SpaceLine))
+                    .is_some()
+                {
+                    ops_push_def_state!(strong);
+                }
             }
         }
     }
@@ -425,16 +482,10 @@ fn parse_tokens_into_operations<'s>(
     (
         single_indent.unwrap_or_else(Indentation::empty),
         ops,
-        int_stack,
     )
 }
 
-struct LabelsMap<'s> {
-    labels_to_ids: HashMap<&'s str, StateId>,
-    ids_to_labels: HashMap<StateId, &'s str>,
-}
-
-fn parse_operations_into_unlinked_states<'s>(ops: Vec<ParseOp>) -> Vec<(StateId, State<'s>)> {
+fn parse_operations_into_unlinked_states<'s>(ops: Vec<ParseOp>) -> (Vec<(StateId, State<'s>)>, LabelsMap<'s>) {
     // - chunk 1 => state 1
     //     - chunk 2 => state 2
     //     - chunk 2 => state 2
@@ -447,27 +498,39 @@ fn parse_operations_into_unlinked_states<'s>(ops: Vec<ParseOp>) -> Vec<(StateId,
     // - chunk 5 => state 4
     // > chunk 5 => state 4
 
-    let mut chunks = vec![(StateId::default(), State::default())];
+    let mut chunks = Vec::new();
+    let mut int_stack = Vec::new();
+    let mut labels_to_ids = HashMap::<&str, StateId>::new();
+    let mut ids_to_labels = HashMap::<StateId, &str>::new();
 
     for op in ops {
         match op {
-            ParseOp::State(id) => chunks.push((id, State::default())),
-            ParseOp::Response(phrase) => {
-                chunks.last_mut().unwrap().1.response_phrases.push(phrase)
+            ParseOp::ApplyIntrinsic(int) => int_stack.push(int),
+            ParseOp::DefState { id, strong } => chunks.push((id, strong, State::default())),
+            ParseOp::PushResponse(phrase) => {
+                chunks.last_mut().unwrap().2.response_phrases.push(phrase)
             }
-            ParseOp::Option(text) => chunks.last_mut().unwrap().1.options.push(YourOption {
-                text,
-                next_state: StateRef::default(),
-            }),
+            ParseOp::PushOption(text) => {
+                chunks.last_mut().unwrap().2.options.push(YourOption {
+                    text,
+                    next_state: StateRef::default(),
+                });
+            }
         }
     }
 
     // merge chunks of the same state
-    chunks.sort_by(|(id, _), (other_id, _)| id.depth.cmp(&other_id.depth));
+    chunks.sort_by(|(id, ..), (other_id, ..)| id.depth.cmp(&other_id.depth));
     let mut states = Vec::new();
     let mut chunks = chunks.into_iter().peekable();
 
-    while let Some((id, mut chunk)) = chunks.next() {
+    while let Some((id, _, mut chunk)) = chunks.next() {
+        while let Some((.., ochunk)) = chunks.next_if(|(oi, o_strong, os)| {
+            !o_strong && oi.depth == id.depth && os.response_phrases.is_empty()
+        }) {
+            chunk.merge_with(ochunk);
+        }
+
         // trim newlines at the end of the phrases that we left on tokenization
         for phrase in &mut chunk.response_phrases {
             trim_end(phrase);
@@ -477,16 +540,10 @@ fn parse_operations_into_unlinked_states<'s>(ops: Vec<ParseOp>) -> Vec<(StateId,
             trim_end(&mut op.text);
         }
 
-        while let Some((_, ochunk)) =
-            chunks.next_if(|(oi, os)| oi.depth == id.depth && os.response_phrases.is_empty())
-        {
-            chunk.merge_with(ochunk);
-        }
-
         states.push((id, chunk));
     }
 
-    states
+    (states, LabelsMap { labels_to_ids, ids_to_labels})
 }
 
 // linking means each state and option knows what is the next state
@@ -559,38 +616,36 @@ fn link_conversation_states(states: Vec<(StateId, State)>) -> HashMap<StateId, S
     linked_states
 }
 
-fn apply_intrinsics<'s>(
-    intrinsics_call_stack: Vec<(Intrinsic<'s>, StateId)>,
-    _states: &mut HashMap<StateId, State>,
-) -> LabelsMap<'s> {
-    let mut labels_to_ids = HashMap::<&str, StateId>::new();
-    let mut ids_to_labels = HashMap::<StateId, &str>::new();
+// fn apply_intrin<'s>(
+//     intrinsics_call_stack: Vec<(Intrinsic<'s>, StateId)>,
+//     _states: &mut HashMap<StateId, State>,
+// ) -> LabelsMap<'s> {
 
-    for (int, id) in intrinsics_call_stack {
-        match int {
-            Intrinsic::Label(lbl) => {
-                if lbl.is_empty() {
-                    panic!("empty label");
-                }
+//     for (int, id) in intrinsics_call_stack {
+//         match int {
+//             Intrinsic::Label(lbl) => {
+//                 if lbl.is_empty() {
+//                     panic!("empty label");
+//                 }
 
-                // TODO: normal errors
-                assert!(
-                    labels_to_ids.insert(lbl, id).is_none(),
-                    "duplicate label {lbl:?}"
-                );
-                assert!(
-                    ids_to_labels.insert(id, lbl).is_none(),
-                    "only one label allowed"
-                );
-            }
-        }
-    }
+//                 // TODO: normal errors
+//                 assert!(
+//                     labels_to_ids.insert(lbl, id).is_none(),
+//                     "duplicate label {lbl:?}"
+//                 );
+//                 assert!(
+//                     ids_to_labels.insert(id, lbl).is_none(),
+//                     "only one label allowed, on label {lbl:?}"
+//                 );
+//             }
+//         }
+//     }
 
-    LabelsMap {
-        labels_to_ids,
-        ids_to_labels,
-    }
-}
+//     LabelsMap {
+//         labels_to_ids,
+//         ids_to_labels,
+//     }
+// }
 
 fn trim_end(s: &mut String) {
     if let Some(end_idx) = s.rfind(|c: char| !c.is_whitespace()) {
@@ -607,13 +662,13 @@ fn trim_end(s: &mut String) {
 
 fn main() {
     let tokens = tokenize(TEST_CONVO);
-    // println!("{:#?}", tokens);
-    // println!("--------------------------");
-    let (indentation, ops, intrinsics_call_stack) = parse_tokens_into_operations(tokens);
-    // println!("{:?}\n{:#?}", indentation, ops);
-    let unlinked_states = parse_operations_into_unlinked_states(ops);
-    let mut states = link_conversation_states(unlinked_states);
-    let labels_map = apply_intrinsics(intrinsics_call_stack, &mut states);
+    println!("{:#?}", tokens);
+    println!("--------------------------");
+    let (indentation, ops) = parse_tokens_into_operations(tokens);
+    println!("{:?}\n{:#?}", indentation, ops);
+    let (unlinked_states, labels_map) = parse_operations_into_unlinked_states(ops);
+    let states = link_conversation_states(unlinked_states);
+    // let labels_map = apply_intrinsics(intrinsics_call_stack, &mut states);
     // println!("--------------------------");
     // println!("{:#?}", unlinked_states);
 
