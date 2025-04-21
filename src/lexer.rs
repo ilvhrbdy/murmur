@@ -17,14 +17,20 @@ fn trim_end(s: &mut String) {
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy, Default)]
 pub struct StateId {
+    pub(super) idx: usize,
     pub(super) depth: u32,
     sibling_counter: u32,
-    pub(super) idx: usize,
 }
 
 impl fmt::Display for StateId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}:{}:{}", self.depth, self.sibling_counter, self.idx)
+        let StateId {
+            depth,
+            sibling_counter,
+            idx,
+        } = self;
+
+        write!(f, "{}:{}:{}", idx, depth, sibling_counter)
     }
 }
 
@@ -33,7 +39,7 @@ pub enum StateRef {
     Label(String),
     Id(StateId),
     #[default]
-    EndConvo,
+    EndOfConvo,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -69,6 +75,11 @@ impl Indentation {
         *n
     }
 
+    pub fn get_mut_amount(&mut self) -> &mut u32 {
+        let (Indentation::Tabs(n) | Indentation::Spaces(n)) = self;
+        n
+    }
+
     fn as_str_name(&self) -> &str {
         match self {
             Indentation::Spaces(_) => "spaces",
@@ -89,6 +100,7 @@ enum TokenKind<'s> {
     Response(&'s str),           // `-` - npc's response phrase in conversation
     Option(&'s str),             // `>` - player's option in conversation
     PhraseContinuation(&'s str), // phrases on newlines excluding indentation
+    Comment,
     SpaceLine,
 }
 
@@ -111,8 +123,8 @@ fn collect_intrinsic<'s>(
 ) -> Option<(Loc, Intrinsic<'s>)> {
     let (loc, word) = collect_word(src, stream)?;
     let int = match word {
-        "lbl" => collect_word(src, stream).map(|(_, w)| Intrinsic::Label(w))?,
-        "jmp" => collect_word(src, stream).map(|(_, w)| Intrinsic::Jump(w))?,
+        "as" => collect_word(src, stream).map(|(_, w)| Intrinsic::Label(w))?,
+        "to" => collect_word(src, stream).map(|(_, w)| Intrinsic::Jump(w))?,
         word => panic!("unknown intrinsic: {word} at {loc:?}"),
     };
 
@@ -142,6 +154,7 @@ fn collect_word<'s>(
     src.get(word_start..=word_end).map(|s| (loc, s))
 }
 
+// yeah this one kind of similar with previous, but who cares?
 fn collect_phrase<'s>(
     src: &'s str,
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
@@ -171,25 +184,21 @@ fn collect_indent(
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
 ) -> Option<Indentation> {
     let mut amount = 0;
-    let (_, ch, _) = stream.peek()?;
+    let (_, ch, _) = stream.peek().copied()?;
 
-    match ch {
-        ' ' => {
-            while stream.next_if(|t| t.1 == ' ').is_some() {
-                amount += 1;
-            }
+    let mut indent = match ch {
+        ' ' => Indentation::Spaces(0),
+        '\t' => Indentation::Tabs(0),
+        _ => return Some(Indentation::empty()),
+    };
 
-            Some(Indentation::Spaces(amount))
-        }
-        '\t' => {
-            while stream.next_if(|t| t.1 == '\t').is_some() {
-                amount += 1;
-            }
-
-            Some(Indentation::Tabs(amount))
-        }
-        _ => Some(Indentation::empty()),
+    while stream.next_if(|t| t.1 == ch).is_some() {
+        amount += 1;
     }
+
+    *indent.get_mut_amount() = amount;
+
+    Some(indent)
 }
 
 fn next_token<'s>(
@@ -197,9 +206,14 @@ fn next_token<'s>(
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
 ) -> Option<Token<'s>> {
     let indentation = collect_indent(stream)?;
-    let (_, ch, _) = stream.peek()?;
+    let (idx, ch, _) = stream.peek()?;
 
     let (loc, kind) = match ch {
+        '/' if matches!(src.get(*idx..=*idx + 1), Some("//")) => {
+            let (.., loc) = stream.next()?;
+            let _ = collect_phrase(src, stream);
+            (loc, TokenKind::Comment)
+        }
         '@' => {
             let _ = stream.next();
             let (loc, int) = collect_intrinsic(src, stream)?;
@@ -331,20 +345,11 @@ pub(super) fn parse_tokens_into_conversation<'s>(
                     ..Default::default()
                 };
 
-                for int in int_stack.drain(..) {
-                    match int {
-                        Intrinsic::Label(lbl) => {
-                            if labels_map.insert(make_label(lbl), state_id).is_some() {
-                                panic!("duplicate label");
-                            }
-                        }
-                        Intrinsic::Jump(lbl) => state.next = StateRef::Label(make_label(lbl)),
-                    }
-                }
-
                 if let Some((mut last_id, last_state, last_token)) = last_modification
                     .and_then(|(id, tk)| states.get_mut(id.idx).map(|s| (id, s, tk)))
                 {
+                    // find sibling of this new state
+
                     // if last state is a sibling
                     if last_id.depth == state_id.depth {
                         state_id.sibling_counter = last_id.sibling_counter + 1;
@@ -362,10 +367,25 @@ pub(super) fn parse_tokens_into_conversation<'s>(
                         state_id.sibling_counter = last_id.sibling_counter + 1;
                     }
 
+                    // try to link previous state with the new one
                     if let TokenKind::Option(_) = &last_token {
-                        last_state.options.last_mut().unwrap().next = StateRef::Id(state_id);
-                    } else if matches!(last_state.next, StateRef::EndConvo) {
+                        let last_opt = last_state.options.last_mut().unwrap();
+                        if let StateRef::EndOfConvo = last_opt.next {
+                            last_opt.next = StateRef::Id(state_id);
+                        }
+                    } else if matches!(last_state.next, StateRef::EndOfConvo) {
                         last_state.next = StateRef::Id(state_id);
+                    }
+                }
+
+                for int in int_stack.drain(..) {
+                    match int {
+                        Intrinsic::Label(lbl) => {
+                            if labels_map.insert(make_label(lbl), state_id).is_some() {
+                                panic!("duplicate label");
+                            }
+                        }
+                        Intrinsic::Jump(lbl) => state.next = StateRef::Label(make_label(lbl)),
                     }
                 }
 
@@ -423,12 +443,46 @@ pub(super) fn parse_tokens_into_conversation<'s>(
                 None => panic!("lonely phrase is not allowed"),
                 _ => unreachable!(),
             },
-            TokenKind::SpaceLine => {}
+            TokenKind::Comment | TokenKind::SpaceLine => {}
         }
     }
 
-    // trim newlines that we kept on tokenization stage
-    for state in &mut states {
+    let find_next_state = |mut current_id: StateId| {
+        // let start_id = current_id;
+        let from = current_id.idx + 1;
+        // println!("searching for next state from {start_id}");
+        loop {
+            'ids_search: for id in &ids[from..] {
+                // println!("searching for {current_id} ... {id}");
+                // if the sibling counter is the same, means it's state of other branch
+                if id.depth != current_id.depth {
+                    // println!("skipping wrong depth {id}");
+                    continue;
+                } else if id.sibling_counter <= current_id.sibling_counter {
+                    // println!("stoped searching on this depth {id}");
+                    break 'ids_search;
+                }
+
+                if id.sibling_counter == current_id.sibling_counter + 1 {
+                    // println!("found {id}\n");
+                    return Some(*id);
+                }
+            }
+
+            let Some(parent) = parents[current_id.idx] else {
+                break;
+            };
+
+            current_id = parent
+        }
+        // println!("not found\n");
+
+        None
+    };
+
+    // link states that didn't got linked on the stage of parsing tokens
+    for (state, id) in states.iter_mut().zip(ids.iter()) {
+        // trim newlines that we kept on tokenization stage
         if let Some(text) = state.response.as_mut().filter(|t| !t.trim().is_empty()) {
             trim_end(text);
         } else {
@@ -442,46 +496,30 @@ pub(super) fn parse_tokens_into_conversation<'s>(
 
             trim_end(&mut opt.text);
         }
-    }
 
-    // link states that didn't got linked on the stage of parsing tokens
-    for (state, id) in states.iter_mut().zip(ids.iter()) {
-        if !matches!(state.next, StateRef::EndConvo) {
-            continue;
+        match &state.next {
+            StateRef::Id(_) => continue,
+            StateRef::Label(name) => assert!(
+                labels_map.contains_key(name),
+                "label {name:?} doesn't exist"
+            ),
+            StateRef::EndOfConvo => (),
         }
 
-        let find_next_state = || {
-            let mut pid = parents[id.idx];
-            while let Some(mut parent) = pid {
-                parent.sibling_counter += 1;
-                if let Some(found) = ids[id.idx + 1..].iter().find(|i| {
-                    i.depth == parent.depth && i.sibling_counter == parent.sibling_counter
-                }) {
-                    return Some(*found);
-                }
-                pid = parents[parent.idx];
-            }
-
-            None
-        };
-
-        let Some(ns_id) = find_next_state() else {
+        let Some(ns_id) = find_next_state(*id) else {
             continue;
         };
 
         state.next = StateRef::Id(ns_id);
 
-        if !state
-            .options
-            .iter()
-            .any(|o| matches!(o.next, StateRef::EndConvo))
-        {
-            continue;
-        }
-
         for opt in &mut state.options {
-            if matches!(opt.next, StateRef::EndConvo) {
-                opt.next = StateRef::Id(ns_id);
+            match &state.next {
+                StateRef::Id(_) => continue,
+                StateRef::Label(name) => assert!(
+                    labels_map.contains_key(name),
+                    "label {name:?} doesn't exist"
+                ),
+                StateRef::EndOfConvo => opt.next = StateRef::Id(ns_id),
             }
         }
     }

@@ -1,75 +1,103 @@
 # WIP
-Not ready at all. Building it only for my own needs, so it is never going to be general purpose, instead use [Yarn Spinner](https://www.yarnspinner.dev/).
-
-## Future features:
-- Game engine agnostic: written as library, easily integrated with any engine, or even without engine by using IO with terminal.
-- Non-bloated: not a programming language, but can be manipulated with any programming language through API.
-- Generates and consumes csv to be able to easily write dialogues translations.
-- Because it is written as a library, you can easily convert dialogue into any format you want.
+Not ready at all. Building it only for my own needs, adding features when needed. Instead use [Yarn Spinner](https://www.yarnspinner.dev/).
 
 ## Concept
-May change in the future.
+The main idea of the project is to just give access to the parser and Conversation struct, that will hold all the information about dialogue from *murmur* file.
+Then you can just translate this struct into any format or other languages for any game engine, or just play with it in the terminal.
 
-Conversation consist of states.
+A conversation consists of states.
 
-State consist of:
-- Response phrases - npc's sequence of phrases 
-- Options - player's option for npc's response
+State consists of:
+- Response - NPC's phrase;
+- Options - player options for this response;
 
-Each states starts with first `-` response phrase:
+## Syntax
+Each state starts with `-` response:
 ```
 - Oh, hi Mark!
 ```
 
-This is one state with two response phrases:
+This is two different states that act as a sequence of phrases:
 ```
 - I don't want to talk to you.
 - Please, go away!
 ```
 
-You can separate two responses into two different states by using two empty lines:
+Each state can have multiple options, defined with `>`:
 ```
-- First state. 
-
-
-- Next state. 
-```
-
-Also you start a new state when defining a response after options:
-
-NOTE: `//` is not a comment in the language, but there will be
-```
-- What are you doing?    // first state
-> NON OF YOUR BUSINESS!
-- Oh shit, I am sorry..  // next state, even though it doesn't have an empty line before it
+- What? Who are you?
+> Don't be scared little girl, I am your friend.
+> I think I killed somebody..
 ```
 
-Each state can have a child state, which means when it ends (and doesn't have any option) it will transition to it's child state, instead of next one:
+If you want only options without the response, just write an empty response, *murmur* will set it to `None`:
 ```
-- I don't want to talk to you! // first state
-    - I said, I don't want to talk to you! Go away! // child of the first state, defined by indentation
-```
-
-In here `state [num]` is just an id of state, the logic of conversation is defined by the order of states and their options
-```
-- What?                             // state 1, response phrase 1
-- What do you want?                 // state 1, response phrase 2
-> Nothing, just wondering around.   // state 1, option 1
-    - Don't talk to me.             // state 2, response phrase 1
-    > Why?                          // state 2, option 1
-        - PLEASE, GO AWAY!          // state 3, response phrase 1, will lead to 'End'
-    > Ok.                           // state 2, option 2, will lead to 'End'
-> I am not talking to you.          // state 1, option 2, will lead to 'End'
-
-
-> End                               // state 4, containing only option, defined by two empty lines
+-
+> Hey are you alive?
 ```
 
-phrases support newlines: this is one phrase and one option, newline will be included, but the indentation is not:
+Each option can have its own child state , defined by indentation, that will be executed if this option is selected:
+```
+- How many?
+> Many-many..
+    - Oh, damn!
+```
+
+NOTE: The kind of indentation is defined by the first it's occurrence, which means that when *murmu* detects 4 spaces as first single indentation it will expect you to be consistent with this choice and don't mix it with tabs :)
+
+Phrases support newlines: this is one phrase and one option, newlines will be included, but the indentation will not:
 ```
 - I am gonna vomit right now..
   Feeling really shitty..
 
 > I don't wanna see it!
   Gonna vomit too..
+```
+
+Comments begin with `//` at the start of the line:
+```
+// nah, this is trash, I don't want to write this
+- What are you doing?    
+> NON OF YOUR BUSINESS!
+
+- Oh shit, I am sorry..
+```
+
+Here you can get a sense of the logic of state transitioning:
+```
+- state 1 => state 2
+- state 2 => from option or End
+> if selected => state 3
+    - state 3 => from option or End
+    > if selected => state 4
+        - state 4 => End
+    > if selected => End
+> if selected => End
+
+// End of conversation
+```
+
+## Builtin functions
+Each function starts with `@` and operates on next response or option:
+
+The `@as <label name>` will create a label for the state item:
+```
+@as Oops
+- F**k off!
+```
+
+The `@to <label name>` will lead this item to the labeled item.
+```
+- ..?
+
+@to Oops
+> Do I look cute?
+```
+
+They can be combined, and they don't care about indentation and newlines:
+```
+// marking response as '@to' will set the next state to the specified label
+// which means it will jump there if there are no options for this state or none is selected
+@as Start @to End
+- ..?
 ```

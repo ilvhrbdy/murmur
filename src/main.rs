@@ -53,7 +53,7 @@ impl fmt::Display for Conversation {
             ($ns:expr) => {
                 match &$ns {
                     StateRef::Label(name) => {
-                        let ns_id = self.labels_map.get(name).unwrap();
+                        let ns_id = self.labels_map.get(name).expect("valid label");
                         writeln!(f, "[{ns_id}] ({name})")?;
                     }
                     StateRef::Id(ns_id) => {
@@ -94,23 +94,28 @@ impl fmt::Display for Conversation {
 }
 
 const TEST_CONVO: &str = "
+// nice
+
 - 0:0:0
-> will jump to 101
-    - 1:0:1 
-    > will jump to 202
-        - 2:0:2 will jump to 015
-    > will jump to 203
-        - 2:0:3
-        > will jump to 015
-        > will jump to 015
-> will jump to 104
-    - 1:0:4
-    > will jump to 015
-- 0:1:5
+> will jump to 110
+    - 1:1:0
+    > will jump to 220
+        - 2:2:0 will jump to 701
+    > will jump to 320
+        - 3:2:0
+        > will jump to 412
+        > will jump to 412
 
-- 0:2:6
-    - 1:0:7
+        - 4:2:1
+        > will jump to 710
+> will jump to 510
+    - 5:1:0
+    - 6:1:1
+    > will jump to 710
+- 7:0:1
 
+- 8:0:2
+    - 9:1:0
 ";
 
 fn main() {
