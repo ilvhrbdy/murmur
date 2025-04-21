@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::iter::Peekable;
-use std::path::Path;
 
 fn trim_end(s: &mut String) {
     if let Some(end_idx) = s.rfind(|c: char| !c.is_whitespace()) {
@@ -17,76 +16,55 @@ fn trim_end(s: &mut String) {
 }
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy, Default)]
-struct StateId {
-    idx: u32,
-    depth: u32,
+pub struct StateId {
+    pub(super) depth: u32,
+    sibling_counter: u32,
+    pub(super) idx: usize,
 }
 
 impl fmt::Display for StateId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}:{}", self.depth, self.idx)
+        write!(f, "{}:{}:{}", self.depth, self.sibling_counter, self.idx)
     }
 }
 
 #[derive(Default, Debug, Clone)]
-enum StateRef {
+pub enum StateRef {
     Label(String),
     Id(StateId),
-    FromOption,
     #[default]
-    End,
-}
-
-impl fmt::Display for StateRef {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            StateRef::Id(id) => write!(f, "{id}"),
-            _ => write!(f, "{self:?}"),
-        }
-    }
+    EndConvo,
 }
 
 #[derive(Default, Debug, Clone)]
-struct State {
-    response_phrases: Vec<String>,
-    options: Vec<YourOption>,
-    next_state: StateRef,
+pub struct State {
+    pub response: Option<String>,
+    pub options: Vec<YourOption>,
+    pub next: StateRef,
 }
 
 #[derive(Default, Debug, Clone)]
-struct YourOption {
-    text: String,
-    next_state: StateRef,
-}
-
-impl State {
-    fn merge_with(&mut self, mut other: Self) {
-        for p in other.response_phrases.drain(..) {
-            self.response_phrases.push(p)
-        }
-
-        for o in other.options.drain(..) {
-            self.options.push(o)
-        }
-    }
+pub struct YourOption {
+    pub text: String,
+    pub next: StateRef,
 }
 
 #[derive(Copy, Clone, Debug)]
-enum Indentation {
+pub enum Indentation {
     Spaces(u32),
     Tabs(u32),
 }
 
 impl Indentation {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Indentation::Spaces(0)
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.get_amount() == 0
     }
 
-    fn get_amount(&self) -> u32 {
+    pub fn get_amount(&self) -> u32 {
         let (Indentation::Tabs(n) | Indentation::Spaces(n)) = self;
         *n
     }
@@ -96,98 +74,6 @@ impl Indentation {
             Indentation::Spaces(_) => "spaces",
             Indentation::Tabs(_) => "tabs",
         }
-    }
-}
-
-pub struct Conversation {
-    indentation: Indentation,
-    states: HashMap<StateId, State>,
-    labels_map: HashMap<String, StateId>,
-}
-
-impl TryFrom<&Path> for Conversation {
-    type Error = std::io::Error;
-
-    fn try_from(p: &Path) -> Result<Self, Self::Error> {
-        let src = std::fs::read_to_string(p)?;
-        Ok(Self::from(src.as_str()))
-    }
-}
-
-impl From<&str> for Conversation {
-    fn from(src: &str) -> Self {
-        let tokens = tokenize(src);
-        // println!("{:#?}", tokens);
-        // println!("--------------------------");
-        let (indentation, ops) = parse_tokens_into_operations(tokens);
-        // println!("{:?}\n{:#?}", indentation, ops);
-        let (unlinked_states, labels_map) = parse_operations_into_unlinked_states(ops);
-        let states = link_conversation_states(unlinked_states);
-        // println!("--------------------------");
-        // println!("{:#?}", unlinked_states);
-
-        Self {
-            indentation,
-            states,
-            labels_map,
-        }
-    }
-}
-
-impl fmt::Display for Conversation {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut sorted = self.states.iter().collect::<Vec<_>>();
-        sorted.sort_by(|(id, _), (oid, _)| id.idx.cmp(&oid.idx));
-
-        let make_indent = |depth: u32| {
-            let mut it = String::new();
-            if depth == 0 {
-                return it;
-            }
-
-            let (ch, n) = match self.indentation {
-                Indentation::Spaces(n) => (' ', n * depth),
-                Indentation::Tabs(n) => ('\t', n * depth),
-            };
-
-            it.reserve(n as _);
-            for _ in 0..n {
-                it.push(ch);
-            }
-
-            it
-        };
-
-        macro_rules! find_lbl_by_id {
-            ($id:ident) => {
-                self.labels_map
-                    .iter()
-                    .find_map(|(l, i)| (i == $id).then_some(l.as_str()))
-            };
-        }
-
-        for (id, state) in sorted {
-            let indent = make_indent(id.depth);
-            let label = find_lbl_by_id!(id).unwrap_or("");
-            writeln!(f, "{indent}({label}) [{id}] => [{}] ", state.next_state)?;
-
-            for rp in &state.response_phrases {
-                writeln!(f, "{indent}- {rp:?}")?;
-            }
-
-            for o in &state.options {
-                let next_state_label = match &o.next_state {
-                    StateRef::Label(name) => name,
-                    StateRef::Id(ns_id) => find_lbl_by_id!(ns_id).unwrap_or(""),
-                    _ => "",
-                };
-                writeln!(f, "{indent}> {:?} => ({next_state_label})", o.text,)?;
-            }
-
-            writeln!(f)?;
-        }
-
-        Ok(())
     }
 }
 
@@ -207,14 +93,14 @@ enum TokenKind<'s> {
 }
 
 #[derive(Debug)]
-struct Token<'s> {
+pub(super) struct Token<'s> {
     kind: TokenKind<'s>,
     loc: Loc,
     indentation: Indentation,
 }
 
 #[derive(Debug)]
-enum Intrinsic<'s> {
+pub(super) enum Intrinsic<'s> {
     Label(&'s str),
     Jump(&'s str),
 }
@@ -222,48 +108,63 @@ enum Intrinsic<'s> {
 fn collect_intrinsic<'s>(
     src: &'s str,
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
-) -> Option<Intrinsic<'s>> {
-    match collect_word(src, stream)? {
-        "lbl" => collect_word(src, stream).map(Intrinsic::Label),
-        "jmp" => collect_word(src, stream).map(Intrinsic::Jump),
-        word => panic!("unknown intrinsic: {word}"),
-    }
+) -> Option<(Loc, Intrinsic<'s>)> {
+    let (loc, word) = collect_word(src, stream)?;
+    let int = match word {
+        "lbl" => collect_word(src, stream).map(|(_, w)| Intrinsic::Label(w))?,
+        "jmp" => collect_word(src, stream).map(|(_, w)| Intrinsic::Jump(w))?,
+        word => panic!("unknown intrinsic: {word} at {loc:?}"),
+    };
+
+    Some((loc, int))
 }
 
 fn collect_word<'s>(
     src: &'s str,
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
-) -> Option<&'s str> {
-    let (word_start, _, _) = stream.peek().copied()?;
+) -> Option<(Loc, &'s str)> {
+    while let Some((_, ch, loc)) = stream.next_if(|(_, ch, _)| ch.is_whitespace()) {
+        if ch == '\n' {
+            return Some((loc, ""));
+        }
+    }
+
+    let (word_start, _, loc) = stream.peek().copied()?;
     let mut word_end: usize = word_start;
 
-    for (idx, ch, _loc) in stream {
+    for (idx, ch, _) in stream {
         if ch.is_whitespace() {
             break;
         }
         word_end = idx;
     }
 
-    src.get(word_start..=word_end).map(str::trim_start)
+    src.get(word_start..=word_end).map(|s| (loc, s))
 }
 
 fn collect_phrase<'s>(
     src: &'s str,
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
-) -> Option<&'s str> {
-    let (phrase_start, _, _) = stream.peek().copied()?;
+) -> Option<(Loc, &'s str)> {
+    while let Some((_, ch, loc)) = stream.next_if(|(_, ch, _)| ch.is_whitespace()) {
+        if ch == '\n' {
+            return Some((loc, ""));
+        }
+    }
+
+    let (phrase_start, _, loc) = stream.peek().copied()?;
     let mut phrase_end: usize = phrase_start;
 
     // NOTE: End is not trimmed, because the phrases may be combined in the future: Response/Option + PhraseContinuation
     //       So the result Option or Response in the state will most likely contains a newline, which will be removed on parsing stage
-    for (idx, ch, _loc) in stream {
+    for (idx, ch, _) in stream {
         phrase_end = idx;
         if ch == '\n' {
             break;
         }
     }
 
-    src.get(phrase_start..=phrase_end).map(str::trim_start)
+    src.get(phrase_start..=phrase_end).map(|s| (loc, s))
 }
 
 fn collect_indent(
@@ -296,26 +197,32 @@ fn next_token<'s>(
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
 ) -> Option<Token<'s>> {
     let indentation = collect_indent(stream)?;
-    let (_, ch, loc) = stream.peek().copied()?;
+    let (_, ch, _) = stream.peek()?;
 
-    let kind = match ch {
+    let (loc, kind) = match ch {
         '@' => {
             let _ = stream.next();
-            TokenKind::Intrinsic(collect_intrinsic(src, stream)?)
+            let (loc, int) = collect_intrinsic(src, stream)?;
+            (loc, TokenKind::Intrinsic(int))
         }
         '>' => {
             let _ = stream.next();
-            TokenKind::Option(collect_phrase(src, stream)?)
+            let (loc, phrase) = collect_phrase(src, stream)?;
+            (loc, TokenKind::Option(phrase))
         }
         '-' => {
             let _ = stream.next();
-            TokenKind::Response(collect_phrase(src, stream)?)
+            let (loc, phrase) = collect_phrase(src, stream)?;
+            (loc, TokenKind::Response(phrase))
         }
         '\n' => {
-            let _ = stream.next();
-            TokenKind::SpaceLine
+            let (.., loc) = stream.next()?;
+            (loc, TokenKind::SpaceLine)
         }
-        _ => TokenKind::PhraseContinuation(collect_phrase(src, stream)?),
+        _ => {
+            let (loc, phrase) = collect_phrase(src, stream)?;
+            (loc, TokenKind::PhraseContinuation(phrase))
+        }
     };
 
     Some(Token {
@@ -325,7 +232,7 @@ fn next_token<'s>(
     })
 }
 
-fn tokenize<'s>(src: &'s str) -> Vec<Token<'s>> {
+pub(super) fn tokenize<'s>(src: &'s str) -> Vec<Token<'s>> {
     let mut tokens = Vec::new();
     let mut loc = Loc { line: 1, col: 1 };
 
@@ -354,37 +261,28 @@ fn tokenize<'s>(src: &'s str) -> Vec<Token<'s>> {
     tokens
 }
 
-#[derive(Debug)]
-enum ParseOp<'s> {
-    DefState {
-        // strong is defined by two newlines
-        // strong state that contains only options will not be merged with previous on the same depth:
-        // - state 1
-        //      - state 2
-        //
-        //
-        // > state 3, defined by two newlines
-        //
-        // but:
-        //
-        // - state 1
-        //      - state 2
-        // > opt of state 1
-        strong: bool,
-        id: StateId,
-    },
-    PushResponse(String),
-    PushOption(YourOption),
-    ApplyIntrinsic(Intrinsic<'s>),
-}
+pub(super) fn parse_tokens_into_conversation<'s>(
+    tokens: Vec<Token<'s>>,
+    module_name: &str, // will be used to generate labels for the current conversation file (module)
+) -> crate::Conversation {
+    let make_label = |name: &str| module_name.to_owned() + "." + name;
 
-fn parse_tokens_into_operations<'s>(tokens: Vec<Token<'s>>) -> (Indentation, Vec<ParseOp<'s>>) {
-    fn try_get_indent_depth(input: Indentation, single: Indentation, loc: Loc) -> u32 {
-        if input.is_empty() {
-            return 0;
+    let mut single_indent: Indentation = Indentation::empty();
+    let mut get_depth_from_token = |token: &Token| -> u32 {
+        if single_indent.is_empty() {
+            if token.indentation.is_empty() {
+                return 0;
+            }
+
+            single_indent = token.indentation;
         }
 
-        let (got_amount, single_amount, indent) = match (input, single) {
+        let loc = Loc {
+            col: 1,
+            ..token.loc
+        };
+
+        let (got_amount, single_amount, indent) = match (token.indentation, &single_indent) {
             (Indentation::Spaces(_), Indentation::Tabs(_)) => {
                 panic!("got spaces instead of tabs at {loc:?}")
             }
@@ -392,283 +290,205 @@ fn parse_tokens_into_operations<'s>(tokens: Vec<Token<'s>>) -> (Indentation, Vec
                 panic!("got tabs instead of spaces at {loc:?}")
             }
             _ => (
-                input.get_amount(),
-                single.get_amount(),
-                single.as_str_name(),
+                token.indentation.get_amount(),
+                single_indent.get_amount(),
+                single_indent.as_str_name(),
             ),
         };
 
         if got_amount % single_amount != 0 {
             panic!(
-                "inconsistent amount of {indent} at {loc:?}: expected {single_amount} as a single, but got {got_amount} total"
+                "inconsistent amount of {indent} at {loc:?}: expected {single_amount} as a single_indent, but got {got_amount} total"
             );
         }
 
         got_amount / single_amount
-    }
+    };
 
-    let mut single_indent: Option<Indentation> = None;
     let mut state_id = StateId::default();
-    let mut ops = vec![ParseOp::DefState {
-        strong: true,
-        id: state_id,
-    }];
-
-    macro_rules! last_mut_op {
-        () => {{
-            ops.iter_mut()
-                .rev()
-                .find(|o| !matches!(o, ParseOp::ApplyIntrinsic(_)))
-        }};
-    }
-
-    macro_rules! ops_push_def_state {
-        (strong) => {
-            ops_push_def_state!(true)
-        };
-        () => {
-            ops_push_def_state!(false)
-        };
-        ($kind:expr) => {
-            // never define state twice
-            if !matches!(last_mut_op!(), Some(ParseOp::DefState { .. })) {
-                state_id.idx += 1;
-                ops.push(ParseOp::DefState {
-                    id: state_id,
-                    strong: $kind,
-                });
-            }
-        };
-    }
-
-    // check if token have different indentation than current one, and if so define a next state
-    macro_rules! process_indent {
-        ($token:ident) => {{
-            if single_indent.is_none() && !$token.indentation.is_empty() {
-                single_indent = Some($token.indentation);
-            }
-
-            let current_depth = state_id.depth;
-            if let Some(single) = single_indent {
-                state_id.depth = try_get_indent_depth($token.indentation, single, $token.loc);
-            }
-
-            if current_depth != state_id.depth {
-                // modify State op, pushed by SpaceLine token, which doesn't have indentation info
-                if let Some(ParseOp::DefState { id, .. }) = last_mut_op!() {
-                    id.depth = state_id.depth;
-                } else {
-                    ops_push_def_state!();
-                }
-            }
-        }};
-    }
-
-    let mut tokens = tokens.into_iter().peekable();
-    while let Some(token) = tokens.next() {
-        match token.kind {
-            TokenKind::Intrinsic(int) => {
-                ops.push(ParseOp::ApplyIntrinsic(int));
-            }
-            TokenKind::Response(phrase) => {
-                if !matches!(last_mut_op!(), Some(ParseOp::PushResponse(_))) {
-                    ops_push_def_state!();
-                }
-                process_indent!(token);
-                ops.push(ParseOp::PushResponse(phrase.to_string()));
-            }
-            TokenKind::Option(phrase) => {
-                process_indent!(token);
-                ops.push(ParseOp::PushOption(YourOption {
-                    text: phrase.to_string(),
-                    next_state: StateRef::default(),
-                }));
-            }
-            TokenKind::PhraseContinuation(phrase) => match last_mut_op!() {
-                Some(ParseOp::PushResponse(ph)) => ph.push_str(phrase),
-                Some(ParseOp::PushOption(o)) => o.text.push_str(phrase),
-                _ => panic!("lonely lost phrase is not allowed: {phrase}"),
-            },
-            TokenKind::SpaceLine => {
-                if tokens
-                    .next_if(|t| matches!(t.kind, TokenKind::SpaceLine))
-                    .is_some()
-                {
-                    ops_push_def_state!(strong);
-                }
-            }
-        }
-    }
-
-    (single_indent.unwrap_or_else(Indentation::empty), ops)
-}
-
-fn parse_operations_into_unlinked_states<'s>(
-    ops: Vec<ParseOp<'s>>,
-) -> (Vec<(StateId, State)>, HashMap<String, StateId>) {
-    // - chunk 1 => state 1
-    //     - chunk 2 => state 2
-    //     - chunk 2 => state 2
-    //     > chunk 2 => state 2
-    //
-    //     - chunk 3 => state 3
-    //     > chunk 3 => state 3
-    // > chunk 4 => state 1
-    //
-    // - chunk 5 => state 4
-    // > chunk 5 => state 4
-
-    let mut ops = ops.into_iter().peekable();
-    let mut chunks = Vec::new();
     let mut int_stack = Vec::new();
     let mut labels_map = HashMap::<String, StateId>::new();
+    let mut last_modification: Option<(StateId, TokenKind)> = None;
 
-    while let Some(op) = ops.next() {
-        match op {
-            ParseOp::ApplyIntrinsic(int) => {
-                int_stack.push(int);
-                while let Some(ParseOp::ApplyIntrinsic(i)) =
-                    ops.next_if(|o| matches!(o, ParseOp::ApplyIntrinsic(_)))
-                {
-                    int_stack.push(i);
-                }
-            }
-            ParseOp::DefState { id, strong } => {
+    let mut ids = Vec::<StateId>::new();
+    let mut parents = Vec::<Option<StateId>>::new();
+    let mut states = Vec::<State>::new();
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::Intrinsic(int) => int_stack.push(int),
+            TokenKind::Response(phrase) => {
+                state_id.depth = get_depth_from_token(&token);
+                state_id.sibling_counter = 0;
+
+                let parent = ids
+                    .iter()
+                    .rev()
+                    .find_map(|i| (i.depth < state_id.depth).then_some(*i));
+
+                let mut state = State {
+                    response: Some(phrase.to_string()),
+                    ..Default::default()
+                };
+
                 for int in int_stack.drain(..) {
                     match int {
                         Intrinsic::Label(lbl) => {
-                            if lbl.is_empty() {
-                                panic!("empty label");
+                            if labels_map.insert(make_label(lbl), state_id).is_some() {
+                                panic!("duplicate label");
                             }
-
-                            // TODO: normal errors
-                            assert!(
-                                labels_map.insert(lbl.to_string(), id).is_none(),
-                                "duplicate label {lbl:?}"
-                            );
                         }
-                        Intrinsic::Jump(_) => panic!("jump is only allowed for the options"),
+                        Intrinsic::Jump(lbl) => state.next = StateRef::Label(make_label(lbl)),
                     }
                 }
-                chunks.push((id, strong, State::default()));
-            }
-            ParseOp::PushResponse(phrase) => {
-                if !int_stack.is_empty() {
-                    panic!("intrinsics is not allowed in the context of response");
+
+                if let Some((mut last_id, last_state, last_token)) = last_modification
+                    .and_then(|(id, tk)| states.get_mut(id.idx).map(|s| (id, s, tk)))
+                {
+                    // if last state is a sibling
+                    if last_id.depth == state_id.depth {
+                        state_id.sibling_counter = last_id.sibling_counter + 1;
+
+                    // if last state is a child of some parent state
+                    } else if last_id.depth > state_id.depth {
+                        // go back along the parents tree until we found a parent with the same depth
+                        while last_id.depth != state_id.depth {
+                            let Some(pid) = parents[last_id.idx] else {
+                                break;
+                            };
+
+                            last_id = pid;
+                        }
+                        state_id.sibling_counter = last_id.sibling_counter + 1;
+                    }
+
+                    if let TokenKind::Option(_) = &last_token {
+                        last_state.options.last_mut().unwrap().next = StateRef::Id(state_id);
+                    } else if matches!(last_state.next, StateRef::EndConvo) {
+                        last_state.next = StateRef::Id(state_id);
+                    }
                 }
 
-                chunks.last_mut().unwrap().2.response_phrases.push(phrase)
+                ids.push(state_id);
+                parents.push(parent);
+                states.push(state);
+                last_modification = Some((state_id, token.kind));
+
+                state_id.idx += 1;
             }
-            ParseOp::PushOption(mut opt) => {
+            TokenKind::Option(phrase) => {
+                let option_depth = get_depth_from_token(&token);
+                let Some((last_id, last_state)) = states
+                    .iter_mut()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(i, s)| (ids[i].depth == option_depth).then_some((ids[i], s)))
+                else {
+                    panic!(
+                        "could find related response for this option on this depth of indentation {state_id}: {phrase:?}"
+                    );
+                };
+
+                let mut opt = YourOption {
+                    text: phrase.to_string(),
+                    next: StateRef::default(),
+                };
+
                 for int in int_stack.drain(..) {
                     match int {
-                        Intrinsic::Label(_) => panic!("can't label option for now"),
-                        Intrinsic::Jump(lbl) => opt.next_state = StateRef::Label(lbl.to_string()),
+                        Intrinsic::Label(_) => panic!("labeling options is not allowed"),
+                        Intrinsic::Jump(lbl) => opt.next = StateRef::Label(make_label(lbl)),
                     }
                 }
 
-                chunks.last_mut().unwrap().2.options.push(opt);
+                last_state.options.push(opt);
+                last_modification = Some((last_id, token.kind));
             }
+            TokenKind::PhraseContinuation(phrase) => match last_modification {
+                Some((_, TokenKind::Response(_))) => states
+                    .last_mut()
+                    .unwrap() // we know that the last state is defined by this token
+                    .response
+                    .as_mut()
+                    .unwrap() // state's response is always defined as Some
+                    .push_str(phrase),
+                Some((_, TokenKind::Option(_))) => states
+                    .last_mut()
+                    .unwrap() // if we managed to push Option token, so at least one state exist
+                    .options
+                    .last_mut()
+                    .unwrap()
+                    .text
+                    .push_str(phrase),
+                None => panic!("lonely phrase is not allowed"),
+                _ => unreachable!(),
+            },
+            TokenKind::SpaceLine => {}
         }
     }
 
-    // merge chunks of the same state
-    chunks.sort_by(|(id, ..), (other_id, ..)| id.depth.cmp(&other_id.depth));
-    let mut states = Vec::new();
-    let mut chunks = chunks.into_iter().peekable();
-
-    while let Some((id, _, mut chunk)) = chunks.next() {
-        while let Some((.., ochunk)) = chunks.next_if(|(oi, o_strong, os)| {
-            !o_strong && oi.depth == id.depth && os.response_phrases.is_empty()
-        }) {
-            chunk.merge_with(ochunk);
+    // trim newlines that we kept on tokenization stage
+    for state in &mut states {
+        if let Some(text) = state.response.as_mut().filter(|t| !t.trim().is_empty()) {
+            trim_end(text);
+        } else {
+            state.response = None;
         }
 
-        // trim newlines at the end of the phrases that we left on tokenization
-        for phrase in &mut chunk.response_phrases {
-            trim_end(phrase);
-        }
+        for opt in &mut state.options {
+            if opt.text.trim().is_empty() {
+                panic!("empty option is not allowed");
+            }
 
-        for op in &mut chunk.options {
-            trim_end(&mut op.text);
+            trim_end(&mut opt.text);
         }
-
-        states.push((id, chunk));
     }
 
-    (states, labels_map)
-}
-
-// linking means each state and option knows what is the next state
-fn link_conversation_states(states: Vec<(StateId, State)>) -> HashMap<StateId, State> {
-    // let mut labels = HashMap::<String, StateId>::new();
-    let mut linked_states = HashMap::from_iter(states.clone());
-
-    for (id, mut state) in states {
-        // if state doesn't have options:
-        //      if have child:
-        //          next_state = child
-        //
-        //      while current_depth state_idx + 1 not a valid state:
-        //          depth -= 1
-        //
-        //      next_state = found state on 'depth' or None
-        if state.options.is_empty() {
-            let mut ns_id = id;
-            ns_id.idx += 1;
-
-            // check if have a child state
-            ns_id.depth += 1;
-            if linked_states.contains_key(&ns_id) {
-                linked_states.get_mut(&id).unwrap().next_state = StateRef::Id(ns_id);
-                continue;
-            }
-
-            // sub depth until a valid next state's id found
-            // *first sub is justified by previous addition to the depth
-            while let Some(new_depth) = ns_id.depth.checked_sub(1) {
-                ns_id.depth = new_depth;
-
-                if linked_states.contains_key(&ns_id) {
-                    linked_states.get_mut(&id).unwrap().next_state = StateRef::Id(ns_id);
-                    break;
-                }
-            }
-
+    // link states that didn't got linked on the stage of parsing tokens
+    for (state, id) in states.iter_mut().zip(ids.iter()) {
+        if !matches!(state.next, StateRef::EndConvo) {
             continue;
         }
 
-        // if state does have options we need to iterate over them and assign for each one a next state
-        for opt in state.options.iter_mut() {
-            if matches!(opt.next_state, StateRef::Label(_)) {
-                continue;
-            }
-
-            let mut ns_id = id;
-            ns_id.idx += 1;
-
-            // check if option have a child state
-            ns_id.depth += 1;
-            if linked_states.contains_key(&ns_id) {
-                opt.next_state = StateRef::Id(ns_id);
-                continue;
-            }
-
-            // sub depth until a valid next state's id found
-            while let Some(new_depth) = ns_id.depth.checked_sub(1) {
-                ns_id.depth = new_depth;
-
-                if linked_states.contains_key(&ns_id) {
-                    opt.next_state = StateRef::Id(ns_id);
-                    break;
+        let find_next_state = || {
+            let mut pid = parents[id.idx];
+            while let Some(mut parent) = pid {
+                parent.sibling_counter += 1;
+                if let Some(found) = ids[id.idx + 1..].iter().find(|i| {
+                    i.depth == parent.depth && i.sibling_counter == parent.sibling_counter
+                }) {
+                    return Some(*found);
                 }
+                pid = parents[parent.idx];
             }
+
+            None
+        };
+
+        let Some(ns_id) = find_next_state() else {
+            continue;
+        };
+
+        state.next = StateRef::Id(ns_id);
+
+        if !state
+            .options
+            .iter()
+            .any(|o| matches!(o.next, StateRef::EndConvo))
+        {
+            continue;
         }
 
-        let s = linked_states.get_mut(&id).unwrap();
-        s.options = state.options;
-        s.next_state = StateRef::FromOption;
+        for opt in &mut state.options {
+            if matches!(opt.next, StateRef::EndConvo) {
+                opt.next = StateRef::Id(ns_id);
+            }
+        }
     }
 
-    linked_states
+    crate::Conversation {
+        indentation: single_indent,
+        states: HashMap::from_iter(ids.into_iter().zip(states)),
+        labels_map,
+    }
 }
