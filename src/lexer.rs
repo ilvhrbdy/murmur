@@ -1,59 +1,5 @@
 use std::collections::HashMap;
-use std::fmt;
 use std::iter::Peekable;
-
-fn trim_end(s: &mut String) {
-    if let Some(end_idx) = s.rfind(|c: char| !c.is_whitespace()) {
-        s.truncate(end_idx + 1);
-    } else {
-        s.clear();
-    }
-
-    // trim start
-    // if let Some(start_idx) = s.find(|c: char| !c.is_whitespace()) {
-    //     let _ = s.drain(..start_idx);
-    // }
-}
-
-#[derive(Hash, Eq, PartialEq, Debug, Clone, Copy, Default)]
-pub struct StateId {
-    pub(super) idx: usize,
-    pub(super) depth: u32,
-    sibling_counter: u32,
-}
-
-impl fmt::Display for StateId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let StateId {
-            depth,
-            sibling_counter,
-            idx,
-        } = self;
-
-        write!(f, "{}:{}:{}", idx, depth, sibling_counter)
-    }
-}
-
-#[derive(Default, Debug, Clone)]
-pub enum StateRef {
-    Label(String),
-    Id(StateId),
-    #[default]
-    EndOfConvo,
-}
-
-#[derive(Default, Debug, Clone)]
-pub struct State {
-    pub response: Option<String>,
-    pub options: Vec<YourOption>,
-    pub next: StateRef,
-}
-
-#[derive(Default, Debug, Clone)]
-pub struct YourOption {
-    pub text: String,
-    pub next: StateRef,
-}
 
 #[derive(Copy, Clone, Debug)]
 pub enum Indentation {
@@ -82,8 +28,20 @@ impl Indentation {
 
     fn as_str_name(&self) -> &str {
         match self {
-            Indentation::Spaces(_) => "spaces",
-            Indentation::Tabs(_) => "tabs",
+            Indentation::Spaces(n) => {
+                if *n != 0 && *n > 1 {
+                    "spaces"
+                } else {
+                    "space"
+                }
+            }
+            Indentation::Tabs(n) => {
+                if *n != 0 && *n > 1 {
+                    "tabs"
+                } else {
+                    "tab"
+                }
+            }
         }
     }
 }
@@ -275,14 +233,20 @@ pub(super) fn tokenize<'s>(src: &'s str) -> Vec<Token<'s>> {
     tokens
 }
 
-pub(super) fn parse_tokens_into_conversation<'s>(
+#[derive(Debug)]
+pub(super) enum StateItem {
+    Response { phrase: String, options: Vec<usize> },
+    Option(String),
+}
+
+pub(super) fn parse_tokens_into_items<'s>(
     tokens: Vec<Token<'s>>,
     module_name: &str, // will be used to generate labels for the current conversation file (module)
-) -> crate::Conversation {
+) -> (Vec<StateItem>, Vec<Option<usize>>, Vec<u32>) {
     let make_label = |name: &str| module_name.to_owned() + "." + name;
 
     let mut single_indent: Indentation = Indentation::empty();
-    let mut get_depth_from_token = |token: &Token| -> u32 {
+    let mut _get_depth_from_token = |token: &Token| -> u32 {
         if single_indent.is_empty() {
             if token.indentation.is_empty() {
                 return 0;
@@ -291,242 +255,269 @@ pub(super) fn parse_tokens_into_conversation<'s>(
             single_indent = token.indentation;
         }
 
-        let loc = Loc {
-            col: 1,
-            ..token.loc
-        };
-
-        let (got_amount, single_amount, indent) = match (token.indentation, &single_indent) {
-            (Indentation::Spaces(_), Indentation::Tabs(_)) => {
-                panic!("got spaces instead of tabs at {loc:?}")
-            }
-            (Indentation::Tabs(_), Indentation::Spaces(_)) => {
-                panic!("got tabs instead of spaces at {loc:?}")
-            }
-            _ => (
-                token.indentation.get_amount(),
-                single_indent.get_amount(),
-                single_indent.as_str_name(),
-            ),
-        };
-
-        if got_amount % single_amount != 0 {
-            panic!(
-                "inconsistent amount of {indent} at {loc:?}: expected {single_amount} as a single_indent, but got {got_amount} total"
-            );
-        }
-
-        got_amount / single_amount
+        get_depth_from_token(token, &single_indent)
     };
 
-    let mut state_id = StateId::default();
+    let mut idx = 0;
     let mut int_stack = Vec::new();
-    let mut labels_map = HashMap::<String, StateId>::new();
-    let mut last_modification: Option<(StateId, TokenKind)> = None;
-
-    let mut ids = Vec::<StateId>::new();
-    let mut parents = Vec::<Option<StateId>>::new();
-    let mut states = Vec::<State>::new();
+    let mut labels_map = HashMap::<String, usize>::new();
+    let mut label_jumps = HashMap::<usize, String>::new();
+    let mut item_depths = Vec::<u32>::new();
+    let mut links = Vec::<Option<usize>>::new();
+    let mut items = Vec::<StateItem>::new();
 
     for token in tokens {
         match token.kind {
             TokenKind::Intrinsic(int) => int_stack.push(int),
-            TokenKind::Response(phrase) => {
-                state_id.depth = get_depth_from_token(&token);
-                state_id.sibling_counter = 0;
-
-                let parent = ids
-                    .iter()
-                    .rev()
-                    .find_map(|i| (i.depth < state_id.depth).then_some(*i));
-
-                let mut state = State {
-                    response: Some(phrase.to_string()),
-                    ..Default::default()
-                };
-
-                if let Some((mut last_id, last_state, last_token)) = last_modification
-                    .and_then(|(id, tk)| states.get_mut(id.idx).map(|s| (id, s, tk)))
-                {
-                    // find sibling of this new state
-
-                    // if last state is a sibling
-                    if last_id.depth == state_id.depth {
-                        state_id.sibling_counter = last_id.sibling_counter + 1;
-
-                    // if last state is a child of some parent state
-                    } else if last_id.depth > state_id.depth {
-                        // go back along the parents tree until we found a parent with the same depth
-                        while last_id.depth != state_id.depth {
-                            let Some(pid) = parents[last_id.idx] else {
-                                break;
-                            };
-
-                            last_id = pid;
-                        }
-                        state_id.sibling_counter = last_id.sibling_counter + 1;
-                    }
-
-                    // try to link previous state with the new one
-                    if let TokenKind::Option(_) = &last_token {
-                        let last_opt = last_state.options.last_mut().unwrap();
-                        if let StateRef::EndOfConvo = last_opt.next {
-                            last_opt.next = StateRef::Id(state_id);
-                        }
-                    } else if matches!(last_state.next, StateRef::EndOfConvo) {
-                        last_state.next = StateRef::Id(state_id);
-                    }
-                }
+            TokenKind::Option(phrase) | TokenKind::Response(phrase) => {
+                let phrase = phrase.to_owned();
 
                 for int in int_stack.drain(..) {
                     match int {
                         Intrinsic::Label(lbl) => {
-                            if labels_map.insert(make_label(lbl), state_id).is_some() {
-                                panic!("duplicate label");
+                            if labels_map.insert(make_label(lbl), idx).is_some() {
+                                panic!("duplicate label: {lbl}");
                             }
                         }
-                        Intrinsic::Jump(lbl) => state.next = StateRef::Label(make_label(lbl)),
+                        Intrinsic::Jump(lbl) => {
+                            let _ = label_jumps.insert(idx, make_label(lbl));
+                        }
                     }
                 }
 
-                ids.push(state_id);
-                parents.push(parent);
-                states.push(state);
-                last_modification = Some((state_id, token.kind));
+                item_depths.push(_get_depth_from_token(&token));
+                links.push(None::<usize>);
+                items.push(match token.kind {
+                    TokenKind::Response(_) => StateItem::Response {
+                        phrase,
+                        options: Vec::new(),
+                    },
+                    TokenKind::Option(_) => StateItem::Option(phrase),
+                    _ => unreachable!(),
+                });
 
-                state_id.idx += 1;
+                idx += 1;
             }
-            TokenKind::Option(phrase) => {
-                let option_depth = get_depth_from_token(&token);
-                let Some((last_id, last_state)) = states
-                    .iter_mut()
-                    .enumerate()
-                    .rev()
-                    .find_map(|(i, s)| (ids[i].depth == option_depth).then_some((ids[i], s)))
-                else {
-                    panic!(
-                        "could find related response for this option on this depth of indentation {state_id}: {phrase:?}"
-                    );
-                };
 
-                let mut opt = YourOption {
-                    text: phrase.to_string(),
-                    next: StateRef::default(),
-                };
-
-                for int in int_stack.drain(..) {
-                    match int {
-                        Intrinsic::Label(_) => panic!("labeling options is not allowed"),
-                        Intrinsic::Jump(lbl) => opt.next = StateRef::Label(make_label(lbl)),
-                    }
+            TokenKind::PhraseContinuation(text) => match items.last_mut() {
+                Some(StateItem::Option(phrase) | StateItem::Response { phrase, .. }) => {
+                    phrase.push_str(text);
                 }
-
-                last_state.options.push(opt);
-                last_modification = Some((last_id, token.kind));
-            }
-            TokenKind::PhraseContinuation(phrase) => match last_modification {
-                Some((_, TokenKind::Response(_))) => states
-                    .last_mut()
-                    .unwrap() // we know that the last state is defined by this token
-                    .response
-                    .as_mut()
-                    .unwrap() // state's response is always defined as Some
-                    .push_str(phrase),
-                Some((_, TokenKind::Option(_))) => states
-                    .last_mut()
-                    .unwrap() // if we managed to push Option token, so at least one state exist
-                    .options
-                    .last_mut()
-                    .unwrap()
-                    .text
-                    .push_str(phrase),
                 None => panic!("lonely phrase is not allowed"),
-                _ => unreachable!(),
             },
             TokenKind::Comment | TokenKind::SpaceLine => {}
         }
     }
 
-    let find_next_state = |mut current_id: StateId| {
-        // let start_id = current_id;
-        let from = current_id.idx + 1;
-        // println!("searching for next state from {start_id}");
-        loop {
-            'ids_search: for id in &ids[from..] {
-                // println!("searching for {current_id} ... {id}");
-                // if the sibling counter is the same, means it's state of other branch
-                if id.depth != current_id.depth {
-                    // println!("skipping wrong depth {id}");
-                    continue;
-                } else if id.sibling_counter <= current_id.sibling_counter {
-                    // println!("stoped searching on this depth {id}");
-                    break 'ids_search;
-                }
-
-                if id.sibling_counter == current_id.sibling_counter + 1 {
-                    // println!("found {id}\n");
-                    return Some(*id);
-                }
-            }
-
-            let Some(parent) = parents[current_id.idx] else {
-                break;
-            };
-
-            current_id = parent
+    for (item, label) in label_jumps.into_iter() {
+        if let Some(idx) = labels_map.get(&label) {
+            links[item] = Some(*idx);
+        } else {
+            panic!("label doesn't exist: {label}");
         }
-        // println!("not found\n");
+    }
 
-        None
+    (items, links, item_depths)
+}
+
+fn get_depth_from_token(token: &Token, single_indent: &Indentation) -> u32 {
+    let loc = Loc {
+        col: 1,
+        ..token.loc
     };
 
-    // link states that didn't got linked on the stage of parsing tokens
-    for (state, id) in states.iter_mut().zip(ids.iter()) {
-        // trim newlines that we kept on tokenization stage
-        if let Some(text) = state.response.as_mut().filter(|t| !t.trim().is_empty()) {
-            trim_end(text);
+    let (got_amount, single_amount, indent) =
+        if let i @ ((Indentation::Spaces(_), Indentation::Tabs(_))
+        | (Indentation::Tabs(_), Indentation::Spaces(_))) = (token.indentation, &single_indent)
+        {
+            panic!(
+                "got {} instead of {} at {loc:?}",
+                i.0.as_str_name(),
+                i.1.as_str_name()
+            )
         } else {
-            state.response = None;
-        }
-
-        for opt in &mut state.options {
-            if opt.text.trim().is_empty() {
-                panic!("empty option is not allowed");
-            }
-
-            trim_end(&mut opt.text);
-        }
-
-        match &state.next {
-            StateRef::Id(_) => continue,
-            StateRef::Label(name) => assert!(
-                labels_map.contains_key(name),
-                "label {name:?} doesn't exist"
-            ),
-            StateRef::EndOfConvo => (),
-        }
-
-        let Some(ns_id) = find_next_state(*id) else {
-            continue;
+            (
+                token.indentation.get_amount(),
+                single_indent.get_amount(),
+                single_indent.as_str_name(),
+            )
         };
 
-        state.next = StateRef::Id(ns_id);
+    if got_amount % single_amount != 0 {
+        panic!(
+            "inconsistent amount of {indent} at {loc:?}: expected {single_amount} as a single_indent, but got {got_amount} total"
+        );
+    }
 
-        for opt in &mut state.options {
-            match &state.next {
-                StateRef::Id(_) => continue,
-                StateRef::Label(name) => assert!(
-                    labels_map.contains_key(name),
-                    "label {name:?} doesn't exist"
-                ),
-                StateRef::EndOfConvo => opt.next = StateRef::Id(ns_id),
+    got_amount / single_amount
+}
+
+pub(super) fn link_state_items(
+    items: &mut [StateItem],
+    links: &mut [Option<usize>],
+    item_depths: &[u32],
+) {
+    let mut states = Vec::<usize>::new();
+    let mut parents = HashMap::<usize, usize>::new();
+    let mut sibling_idx = HashMap::<usize, u32>::new();
+    let mut last_modified_state = None::<usize>;
+
+    for this_item in 0..items.len() {
+        match items[this_item] {
+            StateItem::Response { .. } => {
+                update_family(
+                    this_item,
+                    last_modified_state,
+                    &mut parents,
+                    &mut sibling_idx,
+                    item_depths,
+                );
+
+                if let Some(next @ None) = this_item.checked_sub(1).map(|i| &mut links[i]) {
+                    *next = Some(this_item);
+                }
+
+                states.push(this_item);
+
+                last_modified_state = Some(this_item);
+            }
+            StateItem::Option { .. } => {
+                let Some(state) = states
+                    .iter()
+                    .rev()
+                    .find(|s| item_depths[**s] == item_depths[this_item])
+                    .copied()
+                else {
+                    panic!("could find a state definition for this option");
+                };
+
+                let StateItem::Response { options, .. } = &mut items[state] else {
+                    unreachable!();
+                };
+
+                options.push(this_item);
+
+                last_modified_state = Some(state);
             }
         }
     }
 
-    crate::Conversation {
-        indentation: single_indent,
-        states: HashMap::from_iter(ids.into_iter().zip(states)),
-        labels_map,
+    let mut opts = Vec::<usize>::new();
+
+    for (i, state) in states.iter().copied().enumerate() {
+        let mut next_item = None::<Option<usize>>;
+
+        {
+            let StateItem::Response { options, phrase } = &mut items[state] else {
+                unreachable!();
+            };
+            trim_end(phrase);
+            opts.extend_from_slice(options);
+        }
+
+        for item in std::iter::once(state).chain(opts.drain(..)) {
+            let (StateItem::Response { phrase, .. } | StateItem::Option(phrase)) = &mut items[item];
+            trim_end(phrase);
+
+            let next = &mut links[item];
+
+            if next.is_some() {
+                continue;
+            }
+
+            if next_item.is_none() {
+                next_item = Some(find_next_state_long_long_way(
+                    &states[i..],
+                    &parents,
+                    &sibling_idx,
+                    item_depths,
+                ));
+            }
+
+            *next = next_item.unwrap_or(None);
+        }
     }
+}
+
+fn update_family(
+    new_state: usize,
+    last_modified_state: Option<usize>,
+    states_parents: &mut HashMap<usize, usize>,
+    sibling_idx: &mut HashMap<usize, u32>,
+    item_depths: &[u32],
+) {
+    let mut parent = None;
+    let mut sibling_counter = 0;
+
+    if let Some(last_state) = last_modified_state {
+        // if last state is a sibling
+        if item_depths[last_state] == item_depths[new_state] {
+            sibling_counter = sibling_idx[&last_state] + 1;
+            parent = states_parents.get(&last_state).copied();
+        // if last state is a parent of this new item
+        } else if item_depths[last_state] < item_depths[new_state] {
+            parent = Some(last_state);
+        // if last item is a child of some parent item
+        } else if item_depths[last_state] > item_depths[new_state] {
+            let mut last_state_parent = last_state;
+
+            // go back along the states_parents tree until we found one with the same depth
+            while item_depths[last_state_parent] != item_depths[new_state] {
+                let Some(upper_parent) = states_parents.get(&last_state_parent) else {
+                    break;
+                };
+
+                last_state_parent = *upper_parent;
+            }
+
+            sibling_counter = sibling_idx[&last_state_parent] + 1;
+            parent = states_parents.get(&last_state_parent).copied();
+        }
+    }
+
+    sibling_idx.insert(new_state, sibling_counter);
+    if let Some(p) = parent {
+        states_parents.insert(new_state, p);
+    }
+}
+
+fn find_next_state_long_long_way(
+    states: &[usize],
+    states_parents: &HashMap<usize, usize>,
+    sibling_idx: &HashMap<usize, u32>,
+    item_depths: &[u32],
+) -> Option<usize> {
+    let mut current = states.first().copied()?;
+    loop {
+        'searching: for state in states.iter().skip(1) {
+            if item_depths[current] != item_depths[*state] {
+                continue 'searching;
+            } else if sibling_idx[&current] >= sibling_idx[state] {
+                break 'searching;
+            } else if sibling_idx[&current] + 1 == sibling_idx[state] {
+                return Some(*state);
+            }
+        }
+
+        let Some(parent) = states_parents.get(&current) else {
+            break;
+        };
+
+        current = *parent
+    }
+
+    None
+}
+
+fn trim_end(s: &mut String) {
+    if let Some(end_idx) = s.rfind(|c: char| !c.is_whitespace()) {
+        s.truncate(end_idx + 1);
+    } else {
+        s.clear();
+    }
+
+    // trim start
+    // if let Some(start_idx) = s.find(|c: char| !c.is_whitespace()) {
+    //     let _ = s.drain(..start_idx);
+    // }
 }

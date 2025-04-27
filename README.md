@@ -80,13 +80,13 @@ Here you can get a sense of the logic of state transitioning:
 ## Builtin functions
 Each function starts with `@` and operates on next response or option:
 
-The `@as <label name>` will create a label for the state item:
+- `@as <label name>` will create a label for the state item:
 ```
 @as Oops
 - F**k off!
 ```
 
-The `@to <label name>` will lead this item to the labeled item.
+- `@to <label name>` will lead this item to the specified label:
 ```
 - ..?
 

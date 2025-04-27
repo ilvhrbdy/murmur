@@ -1,92 +1,134 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 mod lexer;
-pub use lexer::{Indentation, State, StateId, StateRef};
+use lexer::StateItem;
 
 // TODO: write tests, please?
 // TODO: change all panics to normal error messages
-// TODO: intrinsic '@include file' will create a name-space 'file'
-//      to refer a label inside of include use '.': 'file.label'
-//      means all labels must be constructed in a way 'file.label'
-//      so we can put all the states with their labels from all the @include into one Conversation
 
-// #[derive(Debug)]
+#[derive(Debug)]
 pub struct Conversation {
-    pub indentation: Indentation,
-    pub states: HashMap<StateId, State>,
-    pub labels_map: HashMap<String, StateId>,
-}
+    items: Vec<StateItem>,
+    links: Vec<Option<usize>>,
 
-impl TryFrom<&Path> for Conversation {
-    type Error = std::io::Error;
-
-    fn try_from(p: &Path) -> Result<Self, Self::Error> {
-        // TODO: errors
-        let file_name = p.file_name().unwrap().to_str().unwrap();
-        let module_name = file_name.strip_suffix(".mur").unwrap_or(file_name);
-        let src = std::fs::read_to_string(p)?;
-        Ok(Self::from_source(src, module_name))
-    }
+    selected_option_item: Option<usize>,
+    current_item: usize,
 }
 
 impl Conversation {
-    fn from_source(src: impl AsRef<str>, module_name: &str) -> Self {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        // TODO: errors
+        let path = path.as_ref();
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        let module_name = file_name.strip_suffix(".mur").unwrap_or(file_name);
+        let src = std::fs::read_to_string(path)?;
+
+        Ok(Self::from_source(src, module_name))
+    }
+
+    pub fn from_source(src: impl AsRef<str>, module_name: &str) -> Self {
         let tokens = lexer::tokenize(src.as_ref());
-        lexer::parse_tokens_into_conversation(tokens, module_name)
+        let (mut items, mut links, item_depths) =
+            lexer::parse_tokens_into_items(tokens, module_name);
+        lexer::link_state_items(&mut items, &mut links, &item_depths);
+
+        Self {
+            items,
+            links,
+            selected_option_item: None,
+            current_item: 0,
+        }
+    }
+
+    pub fn response(&self) -> Option<&str> {
+        self.response_from_item(self.current_item)
+    }
+
+    pub fn options(&self) -> impl Iterator<Item = &str> {
+        self.options_from_item(&self.current_item)
+    }
+
+    pub fn select_option(&mut self, option_idx: usize) -> Option<&str> {
+        let item = self
+            .options_indices_from_item(&self.current_item)
+            .get(option_idx)
+            .copied()?;
+        self.selected_option_item = Some(item);
+        let StateItem::Option(phrase) = &self.items[item] else {
+            unreachable!();
+        };
+
+        Some(phrase.as_str())
+    }
+
+    pub fn next_state(&mut self) -> bool {
+        let Some(next) = self.selected_option_item.or(self.links[self.current_item]) else {
+            return false;
+        };
+
+        self.current_item = next;
+        self.selected_option_item = None;
+
+        true
+    }
+
+    fn response_from_item(&self, item: usize) -> Option<&str> {
+        if let StateItem::Response { phrase, .. } = &self.items[item]
+            && !phrase.is_empty()
+        {
+            Some(phrase)
+        } else {
+            None
+        }
+    }
+
+    fn options_indices_from_item<'s>(&'s self, item: &'s usize) -> &'s [usize] {
+        match &self.items[self.current_item] {
+            StateItem::Response { options, .. } => options.as_slice(),
+            StateItem::Option(_) => std::slice::from_ref(item),
+        }
+    }
+
+    fn options_from_item<'s>(&'s self, item: &'s usize) -> impl Iterator<Item = &'s str> {
+        self.options_indices_from_item(item).iter().map(|opt| {
+            let StateItem::Option(phrase) = &self.items[*opt] else {
+                unreachable!();
+            };
+
+            phrase.as_str()
+        })
     }
 }
 
 impl fmt::Display for Conversation {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut sorted = self.states.iter().collect::<Vec<_>>();
-        sorted.sort_by(|(id, _), (oid, _)| id.idx.cmp(&oid.idx));
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let states = (0..self.items.len())
+            .filter(|item| matches!(self.items[*item], StateItem::Response { .. }));
 
-        macro_rules! find_lbl_by_id {
-            ($id:ident) => {
-                self.labels_map
-                    .iter()
-                    .find_map(|(l, i)| (i == $id).then_some(l.as_str()))
-            };
-        }
-        macro_rules! write_state_ref {
-            ($ns:expr) => {
-                match &$ns {
-                    StateRef::Label(name) => {
-                        let ns_id = self.labels_map.get(name).expect("valid label");
-                        writeln!(f, "[{ns_id}] ({name})")?;
-                    }
-                    StateRef::Id(ns_id) => {
-                        if let Some(name) = find_lbl_by_id!(ns_id) {
-                            writeln!(f, "[{ns_id}] ({name})")?;
-                        } else {
-                            writeln!(f, "[{ns_id}] ()")?;
-                        }
-                    }
-                    ns => writeln!(f, "{ns:?}")?,
-                }
-            };
-        }
-
-        let mut write_state = |id: &StateId, state: &State| -> fmt::Result {
-            let label = find_lbl_by_id!(id).unwrap_or("");
-            write!(f, "[{id}] ({label}) => ")?;
-            write_state_ref!(state.next);
-
-            writeln!(f, "- {:?}", state.response)?;
-
-            for o in &state.options {
-                write!(f, "> {:?} => ", o.text)?;
-                write_state_ref!(o.next);
+        for state_item in states {
+            write!(f, "- ")?;
+            if let Some(phrase) = self.response_from_item(state_item) {
+                write!(f, "{phrase:?}")?;
             }
 
-            writeln!(f, "\n")?;
+            write!(f, " [{state_item} -> ")?;
+            match &self.links[state_item] {
+                Some(next) => writeln!(f, "{next}]")?,
+                None => writeln!(f, "End]")?,
+            }
 
-            Ok(())
-        };
+            for (phrase, opt) in self
+                .options_from_item(&state_item)
+                .zip(self.options_indices_from_item(&state_item))
+            {
+                write!(f, "> {phrase:?} [{opt} -> ")?;
+                match &self.links[*opt] {
+                    Some(next) => writeln!(f, "{next}]")?,
+                    None => writeln!(f, "End]")?,
+                }
+            }
 
-        for (id, state) in sorted {
-            write_state(id, state)?;
+            writeln!(f)?;
         }
 
         Ok(())
@@ -96,34 +138,40 @@ impl fmt::Display for Conversation {
 const TEST_CONVO: &str = "
 // nice
 
-- 0:0:0
-> will jump to 110
-    - 1:1:0
-    > will jump to 220
-        - 2:2:0 will jump to 701
-    > will jump to 320
-        - 3:2:0
-        > will jump to 412
-        > will jump to 412
+- 0 -> 15
+> 1 -> 2
+    - 2 -> 15
+    > 3 -> 4
+        - 4 -> 15
+    > 5 -> 6
+        - 6 -> 9
+        > 7 -> 9
+        > 8 -> 9
 
-        - 4:2:1
-        > will jump to 710
-> will jump to 510
-    - 5:1:0
-    - 6:1:1
-    > will jump to 710
-- 7:0:1
+        - 9 -> 15
+        > 10 -> 15
+> 11 -> 12
+    - 12 -> 13
+    - 13 -> 15
+    > 14 -> 15
+- 15 -> 16
 
-- 8:0:2
-    - 9:1:0
+- 16 -> 17
+    - 17 -> End
 ";
 
 fn main() {
-    let convo = Conversation::from_source(TEST_CONVO, "main");
-    // let convo = Conversation::try_from(Path::new("test.test")).unwrap();
-
-    println!("--------------------------");
-    println!("{}", TEST_CONVO);
-    println!("--------------------------");
-    println!("{}", convo);
+    let mut convo = Conversation::from_source(TEST_CONVO, "main");
+    println!(
+        "- {:?}\n> {:?}\n",
+        convo.response(),
+        convo.options().collect::<Vec<_>>()
+    );
+    convo.select_option(1);
+    convo.next_state();
+    println!(
+        "- {:?}\n> {:?}\n",
+        convo.response(),
+        convo.options().collect::<Vec<_>>()
+    );
 }
