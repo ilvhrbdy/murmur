@@ -62,7 +62,11 @@ impl Conversation {
     }
 
     pub fn next_state(&mut self) -> bool {
-        let Some(next) = self.selected_option_item.or(self.links[self.current_item]) else {
+        let Some(next) = self
+            .selected_option_item
+            .and_then(|opt| self.links[opt])
+            .or(self.links[self.current_item])
+        else {
             return false;
         };
 
@@ -138,7 +142,9 @@ impl fmt::Display for Conversation {
 const TEST_CONVO: &str = "
 // nice
 
+@as Start
 - 0 -> 15
+@to Start
 > 1 -> 2
     - 2 -> 15
     > 3 -> 4
@@ -167,7 +173,7 @@ fn main() {
         convo.response(),
         convo.options().collect::<Vec<_>>()
     );
-    convo.select_option(1);
+    convo.select_option(0);
     convo.next_state();
     println!(
         "- {:?}\n> {:?}\n",
