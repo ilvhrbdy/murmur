@@ -11,33 +11,42 @@ pub struct Conversation {
     items: Vec<StateItem>,
     links: Vec<Option<usize>>,
 
-    selected_option_item: Option<usize>,
     current_item: usize,
 }
 
+#[derive(Debug)]
+pub enum Error {
+    Io(std::io::Error),
+    ZeroStatesDefined,
+}
+
 impl Conversation {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        // TODO: errors
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         let file_name = path.file_name().unwrap().to_str().unwrap();
         let module_name = file_name.strip_suffix(".mur").unwrap_or(file_name);
-        let src = std::fs::read_to_string(path)?;
+        let src = std::fs::read_to_string(path).map_err(Error::Io)?;
 
-        Ok(Self::from_source(src, module_name))
+        if src.trim().is_empty() {
+            return Err(Error::ZeroStatesDefined);
+        }
+
+        Self::from_source(src, module_name)
     }
 
-    pub fn from_source(src: impl AsRef<str>, module_name: &str) -> Self {
+    pub fn from_source(src: impl AsRef<str>, module_name: &str) -> Result<Self, Error> {
         let tokens = lexer::tokenize(src.as_ref());
-        let (mut items, mut links, item_depths) =
-            lexer::parse_tokens_into_items(tokens, module_name);
-        lexer::link_state_items(&mut items, &mut links, &item_depths);
+        let (items, links) = lexer::parse_tokens_into_items(tokens, module_name);
 
-        Self {
+        if items.is_empty() {
+            return Err(Error::ZeroStatesDefined);
+        }
+
+        Ok(Self {
+            current_item: 0,
             items,
             links,
-            selected_option_item: None,
-            current_item: 0,
-        }
+        })
     }
 
     pub fn response(&self) -> Option<&str> {
@@ -48,30 +57,22 @@ impl Conversation {
         self.options_from_item(&self.current_item)
     }
 
-    pub fn select_option(&mut self, option_idx: usize) -> Option<&str> {
-        let item = self
-            .options_indices_from_item(&self.current_item)
-            .get(option_idx)
-            .copied()?;
-        self.selected_option_item = Some(item);
-        let StateItem::Option(phrase) = &self.items[item] else {
-            unreachable!();
-        };
-
-        Some(phrase.as_str())
+    pub fn next_state(&mut self) -> bool {
+        self.next_after_item(self.current_item)
     }
 
-    pub fn next_state(&mut self) -> bool {
-        let Some(next) = self
-            .selected_option_item
-            .and_then(|opt| self.links[opt])
-            .or(self.links[self.current_item])
-        else {
+    pub fn next_state_from_option(&mut self, option_idx: usize) -> Option<bool> {
+        self.options_indices_from_item(&self.current_item)
+            .get(option_idx)
+            .copied()
+            .map(|opt| self.next_after_item(opt))
+    }
+
+    fn next_after_item(&mut self, item: usize) -> bool {
+        let Some(next) = self.links[item] else {
             return false;
         };
-
         self.current_item = next;
-        self.selected_option_item = None;
 
         true
     }
@@ -80,7 +81,7 @@ impl Conversation {
         if let StateItem::Response { phrase, .. } = &self.items[item]
             && !phrase.is_empty()
         {
-            Some(phrase)
+            Some(phrase.as_str())
         } else {
             None
         }
@@ -167,17 +168,17 @@ const TEST_CONVO: &str = "
 ";
 
 fn main() {
-    let mut convo = Conversation::from_source(TEST_CONVO, "main");
-    println!(
-        "- {:?}\n> {:?}\n",
-        convo.response(),
-        convo.options().collect::<Vec<_>>()
-    );
-    convo.select_option(0);
-    convo.next_state();
-    println!(
-        "- {:?}\n> {:?}\n",
-        convo.response(),
-        convo.options().collect::<Vec<_>>()
-    );
+    let mut convo = Conversation::from_source(TEST_CONVO, "main").unwrap();
+
+    loop {
+        println!(
+            "- {:?}\n> {:?}\n",
+            convo.response(),
+            convo.options().collect::<Vec<_>>()
+        );
+
+        if !convo.next_state() {
+            break;
+        }
+    }
 }

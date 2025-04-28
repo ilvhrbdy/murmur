@@ -71,6 +71,7 @@ pub(super) struct Token<'s> {
 
 #[derive(Debug)]
 pub(super) enum Intrinsic<'s> {
+    Import(&'s str),
     Label(&'s str),
     Jump(&'s str),
 }
@@ -83,6 +84,7 @@ fn collect_intrinsic<'s>(
     let int = match word {
         "as" => collect_word(src, stream).map(|(_, w)| Intrinsic::Label(w))?,
         "to" => collect_word(src, stream).map(|(_, w)| Intrinsic::Jump(w))?,
+        "import" => collect_word(src, stream).map(|(_, w)| Intrinsic::Import(w))?,
         word => panic!("unknown intrinsic: {word} at {loc:?}"),
     };
 
@@ -233,93 +235,6 @@ pub(super) fn tokenize<'s>(src: &'s str) -> Vec<Token<'s>> {
     tokens
 }
 
-#[derive(Debug)]
-pub(super) enum StateItem {
-    Response { phrase: String, options: Vec<usize> },
-    Option(String),
-}
-
-pub(super) fn parse_tokens_into_items<'s>(
-    tokens: Vec<Token<'s>>,
-    module_name: &str, // will be used to generate labels for the current conversation file (module)
-) -> (Vec<StateItem>, Vec<Option<usize>>, Vec<u32>) {
-    let make_label = |name: &str| module_name.to_owned() + "." + name;
-
-    let mut single_indent: Indentation = Indentation::empty();
-    let mut _get_depth_from_token = |token: &Token| -> u32 {
-        if single_indent.is_empty() {
-            if token.indentation.is_empty() {
-                return 0;
-            }
-
-            single_indent = token.indentation;
-        }
-
-        get_depth_from_token(token, &single_indent)
-    };
-
-    let mut idx = 0;
-    let mut int_stack = Vec::new();
-    let mut labels_map = HashMap::<String, usize>::new();
-    let mut label_jumps = HashMap::<usize, String>::new();
-    let mut item_depths = Vec::<u32>::new();
-    let mut links = Vec::<Option<usize>>::new();
-    let mut items = Vec::<StateItem>::new();
-
-    for token in tokens {
-        match token.kind {
-            TokenKind::Intrinsic(int) => int_stack.push(int),
-            TokenKind::Option(phrase) | TokenKind::Response(phrase) => {
-                let phrase = phrase.to_owned();
-
-                for int in int_stack.drain(..) {
-                    match int {
-                        Intrinsic::Label(lbl) => {
-                            if labels_map.insert(make_label(lbl), idx).is_some() {
-                                panic!("duplicate label: {lbl}");
-                            }
-                        }
-                        Intrinsic::Jump(lbl) => {
-                            let _ = label_jumps.insert(idx, make_label(lbl));
-                        }
-                    }
-                }
-
-                item_depths.push(_get_depth_from_token(&token));
-                links.push(None::<usize>);
-                items.push(match token.kind {
-                    TokenKind::Response(_) => StateItem::Response {
-                        phrase,
-                        options: Vec::new(),
-                    },
-                    TokenKind::Option(_) => StateItem::Option(phrase),
-                    _ => unreachable!(),
-                });
-
-                idx += 1;
-            }
-
-            TokenKind::PhraseContinuation(text) => match items.last_mut() {
-                Some(StateItem::Option(phrase) | StateItem::Response { phrase, .. }) => {
-                    phrase.push_str(text);
-                }
-                None => panic!("lonely phrase is not allowed"),
-            },
-            TokenKind::Comment | TokenKind::SpaceLine => {}
-        }
-    }
-
-    for (item, label) in label_jumps.into_iter() {
-        if let Some(idx) = labels_map.get(&label) {
-            links[item] = Some(*idx);
-        } else {
-            panic!("label doesn't exist: {label}");
-        }
-    }
-
-    (items, links, item_depths)
-}
-
 fn get_depth_from_token(token: &Token, single_indent: &Indentation) -> u32 {
     let loc = Loc {
         col: 1,
@@ -352,11 +267,112 @@ fn get_depth_from_token(token: &Token, single_indent: &Indentation) -> u32 {
     got_amount / single_amount
 }
 
-pub(super) fn link_state_items(
-    items: &mut [StateItem],
-    links: &mut [Option<usize>],
-    item_depths: &[u32],
-) {
+#[derive(Debug)]
+pub(super) enum StateItem {
+    Response { phrase: String, options: Vec<usize> },
+    Option(String),
+}
+
+pub(super) fn parse_tokens_into_items<'s>(
+    tokens: Vec<Token<'s>>,
+    module_name: &str, // will be used to generate labels for the current conversation file (module)
+) -> (Vec<StateItem>, Vec<Option<usize>>) {
+    let make_label = |name: &str| module_name.to_owned() + "." + name;
+
+    let mut single_indent: Indentation = Indentation::empty();
+    let mut _get_depth_from_token = |token: &Token| -> u32 {
+        if single_indent.is_empty() {
+            if token.indentation.is_empty() {
+                return 0;
+            }
+
+            single_indent = token.indentation;
+        }
+
+        get_depth_from_token(token, &single_indent)
+    };
+
+    let mut idx = 0;
+    let mut int_stack = Vec::new();
+    let mut labels_map = HashMap::<String, usize>::new();
+    let mut label_jumps = HashMap::<usize, String>::new();
+    let mut item_depths = Vec::<u32>::new();
+    let mut links = Vec::<Option<usize>>::new();
+    let mut items = Vec::<StateItem>::new();
+
+    let mut push_state_item = |item: StateItem,
+                               items: &mut Vec<StateItem>,
+                               int_stack: &mut Vec<Intrinsic>,
+                               token: &Token| {
+        for int in int_stack.drain(..) {
+            match int {
+                Intrinsic::Label(lbl) => {
+                    if labels_map.insert(make_label(lbl), idx).is_some() {
+                        panic!("duplicate label: {lbl}");
+                    }
+                }
+                Intrinsic::Jump(lbl) => {
+                    let _ = label_jumps.insert(idx, make_label(lbl));
+                }
+
+                Intrinsic::Import(_module) => {
+                    todo!("find a file in a current directory with the name of the module and tokenize it's content")
+                }
+            }
+        }
+
+        items.push(item);
+        item_depths.push(_get_depth_from_token(token));
+        links.push(None);
+
+        idx += 1;
+    };
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::Intrinsic(int) => int_stack.push(int),
+            TokenKind::Option(phrase) => {
+                push_state_item(
+                    StateItem::Option(phrase.to_owned()),
+                    &mut items,
+                    &mut int_stack,
+                    &token,
+                );
+            }
+            TokenKind::Response(phrase) => push_state_item(
+                StateItem::Response {
+                    phrase: phrase.to_owned(),
+                    options: Vec::new(),
+                },
+                &mut items,
+                &mut int_stack,
+                &token,
+            ),
+
+            TokenKind::PhraseContinuation(text) => match items.last_mut() {
+                Some(StateItem::Option(phrase) | StateItem::Response { phrase, .. }) => {
+                    phrase.push_str(text);
+                }
+                None => panic!("lonely phrase is not allowed"),
+            },
+            TokenKind::Comment | TokenKind::SpaceLine => {}
+        }
+    }
+
+    for (item, label) in label_jumps.into_iter() {
+        if let Some(idx) = labels_map.get(&label) {
+            links[item] = Some(*idx);
+        } else {
+            panic!("label doesn't exist: {label}");
+        }
+    }
+
+    link_state_items(&mut items, &mut links, &item_depths);
+
+    (items, links)
+}
+
+fn link_state_items(items: &mut [StateItem], links: &mut [Option<usize>], item_depths: &[u32]) {
     let mut states = Vec::<usize>::new();
     let mut parents = HashMap::<usize, usize>::new();
     let mut sibling_idx = HashMap::<usize, u32>::new();
