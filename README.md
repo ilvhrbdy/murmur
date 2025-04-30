@@ -78,6 +78,8 @@ Here you can get a sense of the logic of state transitioning:
 ```
 
 ## Builtin functions
+NOTE: Function names aren't final..
+
 Each function starts with `@` and operates on next response or option:
 
 - `@as <label name>` will create a label for the state item:
@@ -94,7 +96,23 @@ Each function starts with `@` and operates on next response or option:
 > Do I look cute?
 ```
 
-They can be combined, and they don't care about indentation and newlines:
+- `@import <module>` defines a `<module>` namespace and makes all labels from the `<module>.mur` file available for use, so you can jump in there with `@to <module>.<label>`. The import is **lazy** - it will not be loaded or parsed unless you jump to it:
+```
+// function is standalon and doesn't require a dialogue item
+@import angry
+
+- ...!
+@to angry.start
+> Did I do something wrong?
+```
+
+In the `angry.mur` file:
+```
+@as start
+- Come closer..
+```
+
+Functions can be combined, and they don't care about indentation and newlines:
 ```
 // marking response as '@to' will set the next state to the specified label
 // which means it will jump there if there are no options for this state or none is selected

@@ -1,5 +1,9 @@
-use std::collections::HashMap;
-use std::iter::Peekable;
+use crate::Error;
+use std::{
+    path::Path,
+    collections::{HashMap, hash_map::Entry},
+    iter::Peekable,
+};
 
 #[derive(Copy, Clone, Debug)]
 pub enum Indentation {
@@ -53,38 +57,39 @@ struct Loc {
 }
 
 #[derive(Debug)]
-enum TokenKind<'s> {
-    Intrinsic(Intrinsic<'s>),
-    Response(&'s str),           // `-` - npc's response phrase in conversation
-    Option(&'s str),             // `>` - player's option in conversation
-    PhraseContinuation(&'s str), // phrases on newlines excluding indentation
+enum TokenKind {
+    Intrinsic(Intrinsic),
+    Response(String),           // `-` - npc's response phrase in conversation
+    Option(String),             // `>` - player's option in conversation
+    PhraseContinuation(String), // phrases on newlines excluding indentation
     Comment,
     SpaceLine,
 }
 
 #[derive(Debug)]
-pub(super) struct Token<'s> {
-    kind: TokenKind<'s>,
+pub(super) struct Token {
+    kind: TokenKind,
     loc: Loc,
     indentation: Indentation,
 }
 
 #[derive(Debug)]
-pub(super) enum Intrinsic<'s> {
-    Import(&'s str),
-    Label(&'s str),
-    Jump(&'s str),
+pub(super) enum Intrinsic {
+    Import(String),
+    Label(String),
+    Jump(String),
 }
 
-fn collect_intrinsic<'s>(
-    src: &'s str,
+fn collect_intrinsic(
+    src: &str,
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
-) -> Option<(Loc, Intrinsic<'s>)> {
+) -> Option<(Loc, Intrinsic)> {
     let (loc, word) = collect_word(src, stream)?;
+    // TODO: error on None or empty word
     let int = match word {
-        "as" => collect_word(src, stream).map(|(_, w)| Intrinsic::Label(w))?,
-        "to" => collect_word(src, stream).map(|(_, w)| Intrinsic::Jump(w))?,
-        "import" => collect_word(src, stream).map(|(_, w)| Intrinsic::Import(w))?,
+        "as" => collect_word(src, stream).map(|(_, w)| Intrinsic::Label(w.into()))?,
+        "to" => collect_word(src, stream).map(|(_, w)| Intrinsic::Jump(w.into()))?,
+        "import" => collect_word(src, stream).map(|(_, w)| Intrinsic::Import(w.into()))?,
         word => panic!("unknown intrinsic: {word} at {loc:?}"),
     };
 
@@ -161,10 +166,10 @@ fn collect_indent(
     Some(indent)
 }
 
-fn next_token<'s>(
-    src: &'s str,
+fn next_token(
+    src: &str,
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
-) -> Option<Token<'s>> {
+) -> Option<Token> {
     let indentation = collect_indent(stream)?;
     let (idx, ch, _) = stream.peek()?;
 
@@ -182,12 +187,12 @@ fn next_token<'s>(
         '>' => {
             let _ = stream.next();
             let (loc, phrase) = collect_phrase(src, stream)?;
-            (loc, TokenKind::Option(phrase))
+            (loc, TokenKind::Option(phrase.into()))
         }
         '-' => {
             let _ = stream.next();
             let (loc, phrase) = collect_phrase(src, stream)?;
-            (loc, TokenKind::Response(phrase))
+            (loc, TokenKind::Response(phrase.into()))
         }
         '\n' => {
             let (.., loc) = stream.next()?;
@@ -195,7 +200,7 @@ fn next_token<'s>(
         }
         _ => {
             let (loc, phrase) = collect_phrase(src, stream)?;
-            (loc, TokenKind::PhraseContinuation(phrase))
+            (loc, TokenKind::PhraseContinuation(phrase.into()))
         }
     };
 
@@ -206,7 +211,7 @@ fn next_token<'s>(
     })
 }
 
-pub(super) fn tokenize<'s>(src: &'s str) -> Vec<Token<'s>> {
+pub(super) fn tokenize(src: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut loc = Loc { line: 1, col: 1 };
 
@@ -235,36 +240,14 @@ pub(super) fn tokenize<'s>(src: &'s str) -> Vec<Token<'s>> {
     tokens
 }
 
-fn get_depth_from_token(token: &Token, single_indent: &Indentation) -> u32 {
-    let loc = Loc {
-        col: 1,
-        ..token.loc
-    };
+pub(super) fn read_mur_file(path: impl AsRef<Path>) -> Result<String, Error> {
+    let src = std::fs::read_to_string(path).map_err(Error::Io)?;
 
-    let (got_amount, single_amount, indent) =
-        if let i @ ((Indentation::Spaces(_), Indentation::Tabs(_))
-        | (Indentation::Tabs(_), Indentation::Spaces(_))) = (token.indentation, &single_indent)
-        {
-            panic!(
-                "got {} instead of {} at {loc:?}",
-                i.0.as_str_name(),
-                i.1.as_str_name()
-            )
-        } else {
-            (
-                token.indentation.get_amount(),
-                single_indent.get_amount(),
-                single_indent.as_str_name(),
-            )
-        };
-
-    if got_amount % single_amount != 0 {
-        panic!(
-            "inconsistent amount of {indent} at {loc:?}: expected {single_amount} as a single_indent, but got {got_amount} total"
-        );
+    if src.trim().is_empty() {
+        return Err(Error::ZeroStatesDefined);
     }
 
-    got_amount / single_amount
+    Ok(src)
 }
 
 #[derive(Debug)]
@@ -273,90 +256,134 @@ pub(super) enum StateItem {
     Option(String),
 }
 
-pub(super) fn parse_tokens_into_items<'s>(
-    tokens: Vec<Token<'s>>,
-    module_name: &str, // will be used to generate labels for the current conversation file (module)
-) -> (Vec<StateItem>, Vec<Option<usize>>) {
-    let make_label = |name: &str| module_name.to_owned() + "." + name;
+pub(super) fn parse_tokens_into_items(
+    main_module: &str, // will be used to generate labels for the current conversation file (module)
+    tokens: Vec<Token>,
+) -> Result<(Vec<StateItem>, Vec<Option<usize>>), Error> {
+    let make_label = |module_name: &str, name: &str| module_name.to_owned() + "." + name;
 
     let mut single_indent: Indentation = Indentation::empty();
-    let mut _get_depth_from_token = |token: &Token| -> u32 {
+    let mut get_depth = |indent: Indentation, loc: Loc| -> u32 {
         if single_indent.is_empty() {
-            if token.indentation.is_empty() {
+            if indent.is_empty() {
                 return 0;
             }
 
-            single_indent = token.indentation;
+            single_indent = indent;
         }
 
-        get_depth_from_token(token, &single_indent)
+        get_depth_from_indent(
+            indent,
+            single_indent,
+            Loc {
+                col: 1,
+                line: loc.line,
+            },
+        )
     };
 
     let mut idx = 0;
-    let mut int_stack = Vec::new();
     let mut labels_map = HashMap::<String, usize>::new();
     let mut label_jumps = HashMap::<usize, String>::new();
+    let mut int_stack = Vec::<Intrinsic>::new();
+
     let mut item_depths = Vec::<u32>::new();
     let mut links = Vec::<Option<usize>>::new();
     let mut items = Vec::<StateItem>::new();
 
-    let mut push_state_item = |item: StateItem,
-                               items: &mut Vec<StateItem>,
-                               int_stack: &mut Vec<Intrinsic>,
-                               token: &Token| {
-        for int in int_stack.drain(..) {
-            match int {
-                Intrinsic::Label(lbl) => {
-                    if labels_map.insert(make_label(lbl), idx).is_some() {
-                        panic!("duplicate label: {lbl}");
+    //  TODO: remove unnecessary allocations
+    let mut modules = HashMap::<String, bool>::from([(main_module.into(), true)]);
+    let mut tokens_to_process = vec![(main_module.to_string(), tokens)];
+
+    macro_rules! register_item {
+        ($module:expr, $indent:expr, $loc:expr) => {{
+            for int in int_stack.drain(..) {
+                match int {
+                    Intrinsic::Label(lbl) => {
+                        if lbl.contains('.') {
+                            panic!("`.` is not allowed in the label name: {lbl}");
+                        }
+
+                        if labels_map.insert(make_label($module, &lbl), idx).is_some() {
+                            panic!("duplicate label: {lbl}");
+                        }
+                    }
+                    Intrinsic::Jump(lbl) => {
+                        let mut parts = lbl.split('.');
+                        let jump = match (parts.next(), parts.next()) {
+                            (Some(module), Some(label)) => {
+                                if let Some(tokens_are_processed) = modules.get_mut(module) {
+                                    if !*tokens_are_processed {
+                                        let src = read_mur_file(format!("{module}.mur"))?;
+                                        let import_tokens = tokenize(&src);
+                                        tokens_to_process.push((module.to_string(), import_tokens));
+                                        *tokens_are_processed = true;
+                                    }
+
+                                    make_label(module, label)
+                                } else {
+                                    panic!("`{module}` is not imported, use @import");
+                                }
+                            }
+                            (Some(label), None) => make_label($module, label),
+                            _ => unreachable!(),
+                        };
+
+                        if let Entry::Vacant(e) = label_jumps.entry(idx) {
+                            e.insert(jump);
+                        } else {
+                            panic!("multiple @to is not allowed");
+                        }
+                    }
+                    Intrinsic::Import(module) => {
+                        if let Entry::Vacant(e) = modules.entry(module) {
+                            e.insert(false);
+                        }
                     }
                 }
-                Intrinsic::Jump(lbl) => {
-                    let _ = label_jumps.insert(idx, make_label(lbl));
-                }
-
-                Intrinsic::Import(_module) => {
-                    todo!("find a file in a current directory with the name of the module and tokenize it's content")
-                }
             }
-        }
+            item_depths.push(get_depth($indent, $loc));
+            links.push(None);
 
-        items.push(item);
-        item_depths.push(_get_depth_from_token(token));
-        links.push(None);
+            idx += 1;
+        }};
+    }
 
-        idx += 1;
-    };
+    while let Some((module_name, module_tokens)) = tokens_to_process.pop() {
+        let offset = items.len();
 
-    for token in tokens {
-        match token.kind {
-            TokenKind::Intrinsic(int) => int_stack.push(int),
-            TokenKind::Option(phrase) => {
-                push_state_item(
-                    StateItem::Option(phrase.to_owned()),
-                    &mut items,
-                    &mut int_stack,
-                    &token,
-                );
-            }
-            TokenKind::Response(phrase) => push_state_item(
-                StateItem::Response {
-                    phrase: phrase.to_owned(),
-                    options: Vec::new(),
+        for token in module_tokens {
+            match token.kind {
+                TokenKind::Intrinsic(int) => {
+                    int_stack.push(int);
+                }
+                TokenKind::Option(phrase) => {
+                    register_item!(&module_name, token.indentation, token.loc);
+                    items.push(StateItem::Option(phrase));
+                }
+                TokenKind::Response(phrase) => {
+                    register_item!(&module_name, token.indentation, token.loc);
+                    items.push(StateItem::Response {
+                        phrase,
+                        options: Vec::new(),
+                    })
+                }
+                TokenKind::PhraseContinuation(text) => match items[offset..].last_mut() {
+                    Some(StateItem::Option(phrase) | StateItem::Response { phrase, .. }) => {
+                        phrase.push_str(&text);
+                    }
+                    None => panic!("lonely phrase is not allowed"),
                 },
-                &mut items,
-                &mut int_stack,
-                &token,
-            ),
-
-            TokenKind::PhraseContinuation(text) => match items.last_mut() {
-                Some(StateItem::Option(phrase) | StateItem::Response { phrase, .. }) => {
-                    phrase.push_str(text);
-                }
-                None => panic!("lonely phrase is not allowed"),
-            },
-            TokenKind::Comment | TokenKind::SpaceLine => {}
+                TokenKind::Comment | TokenKind::SpaceLine => {}
+            }
         }
+
+        link_state_items(
+            offset,
+            &mut items[offset..],
+            &mut links[offset..],
+            &item_depths[offset..],
+        );
     }
 
     for (item, label) in label_jumps.into_iter() {
@@ -367,12 +394,21 @@ pub(super) fn parse_tokens_into_items<'s>(
         }
     }
 
-    link_state_items(&mut items, &mut links, &item_depths);
+    for (module, is_used) in modules {
+        if !is_used {
+            println!("[Warn] `{module}` imported but not used");
+        }
+    }
 
-    (items, links)
+    Ok((items, links))
 }
 
-fn link_state_items(items: &mut [StateItem], links: &mut [Option<usize>], item_depths: &[u32]) {
+fn link_state_items(
+    offset: usize,
+    items: &mut [StateItem],
+    links: &mut [Option<usize>],
+    item_depths: &[u32],
+) {
     let mut states = Vec::<usize>::new();
     let mut parents = HashMap::<usize, usize>::new();
     let mut sibling_idx = HashMap::<usize, u32>::new();
@@ -390,7 +426,7 @@ fn link_state_items(items: &mut [StateItem], links: &mut [Option<usize>], item_d
                 );
 
                 if let Some(next @ None) = this_item.checked_sub(1).map(|i| &mut links[i]) {
-                    *next = Some(this_item);
+                    *next = Some(this_item + offset);
                 }
 
                 states.push(this_item);
@@ -442,17 +478,47 @@ fn link_state_items(items: &mut [StateItem], links: &mut [Option<usize>], item_d
             }
 
             if next_item.is_none() {
-                next_item = Some(find_next_state_long_long_way(
-                    &states[i..],
-                    &parents,
-                    &sibling_idx,
-                    item_depths,
-                ));
+                next_item = Some(
+                    find_next_state_long_long_way(
+                        &states[i..],
+                        &parents,
+                        &sibling_idx,
+                        item_depths,
+                    )
+                    .map(|item_idx| item_idx + offset),
+                );
             }
 
             *next = next_item.unwrap_or(None);
         }
     }
+}
+
+fn get_depth_from_indent(indentation: Indentation, single_indent: Indentation, loc: Loc) -> u32 {
+    let (got_amount, single_amount, indent) =
+        if let i @ ((Indentation::Spaces(_), Indentation::Tabs(_))
+        | (Indentation::Tabs(_), Indentation::Spaces(_))) = (indentation, &single_indent)
+        {
+            panic!(
+                "got {} instead of {} at {loc:?}",
+                i.0.as_str_name(),
+                i.1.as_str_name()
+            )
+        } else {
+            (
+                indentation.get_amount(),
+                single_indent.get_amount(),
+                single_indent.as_str_name(),
+            )
+        };
+
+    if got_amount % single_amount != 0 {
+        panic!(
+            "inconsistent amount of {indent} at {loc:?}: expected {single_amount} as a single_indent, but got {got_amount} total"
+        );
+    }
+
+    got_amount / single_amount
 }
 
 fn update_family(
