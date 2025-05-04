@@ -3,8 +3,34 @@ use std::path::Path;
 mod lexer;
 use lexer::StateItem;
 
+// TODO: label processing:
+//      - iterate over defined (label, indent)
+//      if indent > labeled_item:
+//          define_module(
+//              current_module_name,
+//              items.take_while(item.depth > label.depth)
+//          )
+// TODO: disallow putting multiple intrinsics on the same line, each must have it's own as they are legit items of conversation
+// TODO: isolated chunks/blocks:
+//      @as label1
+//      - this item exists in the conversation and linked from/to other items
+//
+//      @as label2
+//          - but this is only exists and
+// TODO: @if @elif @else
+// TODO: @call and function mapping / linking
+// TODO: @{} - text expansion function (either text of labeled item or function)
+//      in this case we cannot have labeled item and function with the same name
+// TODO: the `main` module is always available even without @import and it kind of counter-intuitive. should i fix that?
 // TODO: write tests, please?
 // TODO: change all panics to normal error messages
+// TODO: we could warn for some weird behavior like this:
+//
+//      @as aboba
+//      @jump aboba
+//
+//      which is a valid murmur syntax, but just an infinite loop
+//      maybe i need to be strict with this kind of shit?
 
 #[derive(Debug)]
 pub enum Error {
@@ -38,7 +64,7 @@ pub struct Conversation {
     items: Vec<StateItem>,
     links: Vec<Option<usize>>,
 
-    current_item: usize,
+    current: usize,
 }
 
 impl Conversation {
@@ -60,34 +86,37 @@ impl Conversation {
         }
 
         Ok(Self {
-            current_item: 0,
+            current: 0,
             items,
             links,
         })
     }
 
     pub fn response(&self) -> Option<&str> {
-        self.response_from_item(self.current_item)
+        self.response_in_state(self.current)
     }
 
     pub fn options(&self) -> impl Iterator<Item = &str> {
-        self.options_from_item(&self.current_item)
+        self.options_in_state(&self.current)
     }
 
     pub fn next_state(&mut self) -> Option<()> {
-        self.current_item = self.links[self.current_item]?;
+        self.current = self.next_state_after(self.current)?;
         Some(())
     }
 
     pub fn next_state_from_option(&mut self, option_idx: usize) -> Option<()> {
-        self.current_item = self.options_indices_from_item(&self.current_item)
+        // TODO: either option idx is invalid or there is no next_state..
+        self.current = self
+            .options_indices_in_state(&self.current)
             .get(option_idx)
-            .and_then(|opt| self.links[*opt])?;
+            .and_then(|opt| self.next_state_after(*opt))?;
+
         Some(())
     }
 
-    fn response_from_item(&self, item: usize) -> Option<&str> {
-        if let StateItem::Response { phrase, .. } = &self.items[item]
+    fn response_in_state(&self, state: usize) -> Option<&str> {
+        if let StateItem::Response { phrase, .. } = &self.items[state]
             && !phrase.is_empty()
         {
             Some(phrase.as_str())
@@ -96,15 +125,16 @@ impl Conversation {
         }
     }
 
-    fn options_indices_from_item<'s>(&'s self, item: &'s usize) -> &'s [usize] {
-        match &self.items[*item] {
+    fn options_indices_in_state<'s>(&'s self, state: &'s usize) -> &'s [usize] {
+        match &self.items[*state] {
             StateItem::Response { options, .. } => options.as_slice(),
-            StateItem::Option(_) => std::slice::from_ref(item),
+            StateItem::Option(_) => std::slice::from_ref(state),
+            StateItem::Jump => unreachable!(),
         }
     }
 
-    fn options_from_item<'s>(&'s self, item: &'s usize) -> impl Iterator<Item = &'s str> {
-        self.options_indices_from_item(item).iter().map(|opt| {
+    fn options_in_state<'s>(&'s self, state: &'s usize) -> impl Iterator<Item = &'s str> {
+        self.options_indices_in_state(state).iter().map(|opt| {
             let StateItem::Option(phrase) = &self.items[*opt] else {
                 unreachable!();
             };
@@ -112,15 +142,24 @@ impl Conversation {
             phrase.as_str()
         })
     }
+
+    fn next_state_after(&self, mut state: usize) -> Option<usize> {
+        state = self.links[state]?;
+        while let StateItem::Jump = &self.items[state] {
+            state = self.links[state]?;
+        }
+
+        Some(state)
+    }
 }
 
-// TODO: i am not sure about that..
+// TODO: i am not sure about that.. i mean you cannot easily display the convo, that have conditions, options and stuff
 impl fmt::Display for Conversation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut state = 0;
         loop {
             write!(f, "- ")?;
-            if let Some(phrase) = self.response_from_item(state) {
+            if let Some(phrase) = self.response_in_state(state) {
                 write!(f, "{phrase:?}")?;
             }
 
@@ -131,8 +170,8 @@ impl fmt::Display for Conversation {
             }
 
             for (phrase, opt) in self
-                .options_from_item(&state)
-                .zip(self.options_indices_from_item(&state))
+                .options_in_state(&state)
+                .zip(self.options_indices_in_state(&state))
             {
                 write!(f, "> {phrase:?} [{opt} -> ")?;
                 match &self.links[*opt] {
@@ -141,7 +180,7 @@ impl fmt::Display for Conversation {
                 }
             }
 
-            if let Some(next_state) = self.links[state] {
+            if let Some(next_state) = self.next_state_after(state) {
                 state = next_state;
                 writeln!(f)?;
             } else {
@@ -154,7 +193,7 @@ impl fmt::Display for Conversation {
 }
 
 const TEST_CONVO: &str = "
-// nice
+# nice
 
 @import test
 
@@ -182,8 +221,8 @@ const TEST_CONVO: &str = "
     - 17 -> 19
 > 18 -> 19
 
-@to test.Test
-- 19 -> 20 which is in test.mur file
+- 19 -> 20 which is a jump to a test.mur file -> 21
+# @jump test.Test // 20 -> 21 which is in test.mur file
 ";
 
 fn main() {

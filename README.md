@@ -1,23 +1,31 @@
 # WIP
-Not ready at all. Building it only for my own needs, adding features when needed. Instead use [Yarn Spinner](https://www.yarnspinner.dev/).
+Not ready at all. Building it only for my own needs, adding features when needed. Instead use [Yarn Spinner](https:#www.yarnspinner.dev/).
 
 ## Concept
 The main idea of the project is to just give access to the parser and Conversation struct, that will hold all the information about dialogue from *murmur* file.
 Then you can just translate this struct into any format or other languages for any game engine, or just play with it in the terminal.
 
+## Future features
+Extensible and flexible: able to hold your generic external game state `Conversation<ExternalState>`, which will be mutated through functions map of `fn(&mut ExternalState) -> OptionalOutput`, these can be called via intrinsics `@call`, `@if @elif @else`, text expansion `@{}`.
+This means *murmur* doesn't care about how your game state looks like, and how you define your functions map, it will just call them, when you ask.
+
+Fast: conversation is parsed into static arrays (states, functions, labels etc), which are linked together by indices. This means no runtime hashing or validation.
+
+Portable: *murmur* will be able to convert `.mur` files into CSV, JSON and binary formats.
+
+## Syntax
 A conversation consists of states.
 
 State consists of:
 - Response - NPC's phrase;
 - Options - player options for this response;
 
-## Syntax
 Each state starts with `-` response:
 ```
 - Oh, hi Mark!
 ```
 
-This is two different states that act as a sequence of phrases:
+This is two different states that act as a sequence of NPC phrases:
 ```
 - I don't want to talk to you.
 - Please, go away!
@@ -36,7 +44,7 @@ If you want only options without the response, just write an empty response, *mu
 > Hey are you alive?
 ```
 
-Each option can have its own child state , defined by indentation, that will be executed if this option is selected:
+Each option can have its own child state, defined by indentation, that will be executed only if this option is selected:
 ```
 - How many?
 > Many-many..
@@ -54,13 +62,12 @@ Phrases support newlines: this is one phrase and one option, newlines will be in
   Gonna vomit too..
 ```
 
-Comments begin with `//` at the start of the line:
+Comments begin with `#` at the start of the line:
 ```
-// nah, this is trash, I don't want to write this
-- What are you doing?    
-> NON OF YOUR BUSINESS!
+- Wanna talk?   
+# > I am gay.
 
-- Oh shit, I am sorry..
+- Ok, it is fine, we can talk later.
 ```
 
 Here you can get a sense of the logic of state transitioning:
@@ -74,7 +81,7 @@ Here you can get a sense of the logic of state transitioning:
     > if selected => End
 > if selected => End
 
-// End of conversation
+# End of conversation
 ```
 
 ## Builtin functions
@@ -82,28 +89,29 @@ NOTE: Function names aren't final..
 
 Each function starts with `@` and operates on next response or option:
 
-- `@as <label name>` will create a label for the state item:
+- `@as <label name>` will create a label for the next state item:
 ```
 @as Oops
 - F**k off!
 ```
 
-- `@to <label name>` will lead this item to the specified label:
+- `@jump <label name>` will lead this item to the specified label:
 ```
 - ..?
 
-@to Oops
 > Do I look cute?
+    # as a child of an option this jump will be executed
+    # only if the option is selected
+    @jump Oops
 ```
 
 - `@import <module>` defines a `<module>` namespace and makes all labels from the `<module>.mur` file available for use, so you can jump in there with `@to <module>.<label>`. The import is **lazy** - it will not be loaded or parsed unless you jump to it:
 ```
-// function is standalon and doesn't require a dialogue item
 @import angry
 
 - ...!
-@to angry.start
 > Did I do something wrong?
+    @jump angry.start
 ```
 
 In the `angry.mur` file:
@@ -112,10 +120,3 @@ In the `angry.mur` file:
 - Come closer..
 ```
 
-Functions can be combined, and they don't care about indentation and newlines:
-```
-// marking response as '@to' will set the next state to the specified label
-// which means it will jump there if there are no options for this state or none is selected
-@as Start @to End
-- ..?
-```

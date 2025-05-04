@@ -1,8 +1,8 @@
 use crate::Error;
 use std::{
-    path::Path,
     collections::{HashMap, hash_map::Entry},
     iter::Peekable,
+    path::Path,
 };
 
 #[derive(Copy, Clone, Debug)]
@@ -50,6 +50,13 @@ impl Indentation {
     }
 }
 
+impl Default for Indentation {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+
 #[derive(Copy, Clone, Debug)]
 struct Loc {
     line: u32,
@@ -58,7 +65,9 @@ struct Loc {
 
 #[derive(Debug)]
 enum TokenKind {
-    Intrinsic(Intrinsic),
+    IntrinsicJump(String),
+    IntrinsicLabel(String),
+    IntrinsicImport(String),
     Response(String),           // `-` - npc's response phrase in conversation
     Option(String),             // `>` - player's option in conversation
     PhraseContinuation(String), // phrases on newlines excluding indentation
@@ -73,23 +82,16 @@ pub(super) struct Token {
     indentation: Indentation,
 }
 
-#[derive(Debug)]
-pub(super) enum Intrinsic {
-    Import(String),
-    Label(String),
-    Jump(String),
-}
-
 fn collect_intrinsic(
     src: &str,
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
-) -> Option<(Loc, Intrinsic)> {
+) -> Option<(Loc, TokenKind)> {
     let (loc, word) = collect_word(src, stream)?;
     // TODO: error on None or empty word
     let int = match word {
-        "as" => collect_word(src, stream).map(|(_, w)| Intrinsic::Label(w.into()))?,
-        "to" => collect_word(src, stream).map(|(_, w)| Intrinsic::Jump(w.into()))?,
-        "import" => collect_word(src, stream).map(|(_, w)| Intrinsic::Import(w.into()))?,
+        "as" => collect_word(src, stream).map(|(_, w)| TokenKind::IntrinsicLabel(w.into()))?,
+        "jump" => collect_word(src, stream).map(|(_, w)| TokenKind::IntrinsicJump(w.into()))?,
+        "import" => collect_word(src, stream).map(|(_, w)| TokenKind::IntrinsicImport(w.into()))?,
         word => panic!("unknown intrinsic: {word} at {loc:?}"),
     };
 
@@ -171,18 +173,17 @@ fn next_token(
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
 ) -> Option<Token> {
     let indentation = collect_indent(stream)?;
-    let (idx, ch, _) = stream.peek()?;
+    let (_, ch, _) = stream.peek()?;
 
     let (loc, kind) = match ch {
-        '/' if matches!(src.get(*idx..=*idx + 1), Some("//")) => {
+        '#' => {
             let (.., loc) = stream.next()?;
             let _ = collect_phrase(src, stream);
             (loc, TokenKind::Comment)
         }
         '@' => {
             let _ = stream.next();
-            let (loc, int) = collect_intrinsic(src, stream)?;
-            (loc, TokenKind::Intrinsic(int))
+            collect_intrinsic(src, stream)?
         }
         '>' => {
             let _ = stream.next();
@@ -254,27 +255,90 @@ pub(super) fn read_mur_file(path: impl AsRef<Path>) -> Result<String, Error> {
 pub(super) enum StateItem {
     Response { phrase: String, options: Vec<usize> },
     Option(String),
+    Jump,
+}
+
+#[derive(Default)]
+struct ParserData {
+    single_indentation: Indentation,
+    labels_map: HashMap<String, usize>,
+    label_jumps: HashMap<usize, String>, // to store all jumps before all labels are defined
+
+    modules: HashMap<String, bool>, // keep track of what is already imported
+    load_queue: Vec<(String, Vec<Token>)>,
+
+    // Result
+    errors: Vec<Error>,
+    items: Vec<StateItem>,
+    links: Vec<Option<usize>>,
 }
 
 pub(super) fn parse_tokens_into_items(
-    main_module: &str, // will be used to generate labels for the current conversation file (module)
+    main_module: &str,
     tokens: Vec<Token>,
 ) -> Result<(Vec<StateItem>, Vec<Option<usize>>), Error> {
-    let make_label = |module_name: &str, name: &str| module_name.to_owned() + "." + name;
+    let mut parser = ParserData::default();
 
-    let mut single_indent: Indentation = Indentation::empty();
+    // TODO: avoid second allocation for the name
+    parser.modules.insert(main_module.into(), true);
+    parser.load_queue.push((main_module.into(), tokens));
+
+    while !parser.load_queue.is_empty() {
+        parse_module(&mut parser);
+    }
+
+    if !parser.errors.is_empty() {
+        return Err(Error::Multiple(parser.errors));
+    }
+
+    for (item, label) in parser.label_jumps {
+        if let Some(idx) = parser.labels_map.get(&label) {
+            parser.links[item] = Some(*idx);
+        } else {
+            panic!("label doesn't exist: {label}");
+        }
+    }
+
+    for (module, is_used) in parser.modules {
+        if !is_used {
+            println!("[Warn] `{module}` was not loaded");
+        }
+    }
+
+    Ok((parser.items, parser.links))
+}
+
+fn parse_module(
+    ParserData {
+        load_queue,
+        modules,
+        single_indentation,
+        labels_map,
+        label_jumps,
+        items,
+        links,
+        errors,
+    }: &mut ParserData,
+) {
+    let link_offset = items.len();
+    let Some((module_name, tokens)) = load_queue.pop() else {
+        return;
+    };
+
+    let make_label = |m: &str, l: &str| m.to_owned() + "." + l;
+
     let mut get_depth = |indent: Indentation, loc: Loc| -> u32 {
-        if single_indent.is_empty() {
+        if single_indentation.is_empty() {
             if indent.is_empty() {
                 return 0;
             }
 
-            single_indent = indent;
+            *single_indentation = indent;
         }
 
         get_depth_from_indent(
             indent,
-            single_indent,
+            *single_indentation,
             Loc {
                 col: 1,
                 line: loc.line,
@@ -282,141 +346,133 @@ pub(super) fn parse_tokens_into_items(
         )
     };
 
-    let mut idx = 0;
-    let mut labels_map = HashMap::<String, usize>::new();
-    let mut label_jumps = HashMap::<usize, String>::new();
-    let mut int_stack = Vec::<Intrinsic>::new();
-
+    let mut local_imports = HashMap::<String, bool>::new();
+    let mut module_items = Vec::<StateItem>::new();
     let mut item_depths = Vec::<u32>::new();
-    let mut links = Vec::<Option<usize>>::new();
-    let mut items = Vec::<StateItem>::new();
+    let mut label_to_assign = None::<(Indentation, String)>;
 
-    //  TODO: remove unnecessary allocations
-    let mut modules = HashMap::<String, bool>::from([(main_module.into(), true)]);
-    let mut tokens_to_process = vec![(main_module.to_string(), tokens)];
+    for token in tokens {
+        macro_rules! push_state_item {
+            ($item:expr) => {{
+                // TODO: check indentation
+                if let Some((_indent, label)) = label_to_assign.take() {
+                    let _ = labels_map.insert(label, module_items.len() + link_offset);
+                }
 
-    macro_rules! register_item {
-        ($module:expr, $indent:expr, $loc:expr) => {{
-            for int in int_stack.drain(..) {
-                match int {
-                    Intrinsic::Label(lbl) => {
-                        if lbl.contains('.') {
-                            panic!("`.` is not allowed in the label name: {lbl}");
+                module_items.push($item);
+                item_depths.push(get_depth(token.indentation, token.loc));
+            }};
+        }
+
+        match token.kind {
+            TokenKind::PhraseContinuation(text) => match module_items.last_mut() {
+                Some(StateItem::Option(phrase) | StateItem::Response { phrase, .. }) => {
+                    phrase.push_str(&text);
+                }
+                Some(StateItem::Jump) | None => panic!("this text must belong to `-` response or `>` option: {:?}", token.loc)
+            },
+            TokenKind::Response(phrase) => push_state_item!(StateItem::Response {
+                phrase,
+                options: Vec::new(),
+            }),
+            TokenKind::Option(phrase) => push_state_item!(StateItem::Option(phrase)),
+            TokenKind::IntrinsicJump(label) => {
+                let mut parts = label.split('.');
+                let jump_target = match (parts.next(), parts.next()) {
+                    (Some(import_name), Some(_)) => {
+                        if let Some(is_used) = local_imports.get_mut(import_name) {
+                            *is_used = true;
+                        } else {
+                            panic!("`{import_name}` is not imported");
                         }
 
-                        if labels_map.insert(make_label($module, &lbl), idx).is_some() {
-                            panic!("duplicate label: {lbl}");
-                        }
-                    }
-                    Intrinsic::Jump(lbl) => {
-                        let mut parts = lbl.split('.');
-                        let jump = match (parts.next(), parts.next()) {
-                            (Some(module), Some(label)) => {
-                                if let Some(tokens_are_processed) = modules.get_mut(module) {
-                                    if !*tokens_are_processed {
-                                        let src = read_mur_file(format!("{module}.mur"))?;
-                                        let import_tokens = tokenize(&src);
-                                        tokens_to_process.push((module.to_string(), import_tokens));
-                                        *tokens_are_processed = true;
-                                    }
-
-                                    make_label(module, label)
-                                } else {
-                                    panic!("`{module}` is not imported, use @import");
-                                }
-                            }
-                            (Some(label), None) => make_label($module, label),
-                            _ => unreachable!(),
+                        let Some(is_loaded) = modules.get_mut(import_name) else {
+                            panic!("`{import_name}` is not imported, use @import");
                         };
 
-                        if let Entry::Vacant(e) = label_jumps.entry(idx) {
-                            e.insert(jump);
-                        } else {
-                            panic!("multiple @to is not allowed");
+                        if !*is_loaded {
+                            let src = match read_mur_file(format!("{import_name}.mur")) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    errors.push(e);
+                                    continue;
+                                }
+                            };
+                            let import_tokens = tokenize(&src);
+                            load_queue.push((import_name.to_string(), import_tokens));
+                            *is_loaded = true;
                         }
+
+                        label
                     }
-                    Intrinsic::Import(module) => {
-                        if let Entry::Vacant(e) = modules.entry(module) {
-                            e.insert(false);
-                        }
-                    }
+                    (Some(label), None) => make_label(&module_name, label),
+                    _ => unreachable!(),
+                };
+
+                assert!(
+                    label_jumps.insert(module_items.len(), jump_target).is_none(),
+                    "it seems like jump got overwritten, is it even possilbe?"
+                );
+
+                push_state_item!(StateItem::Jump);
+            }
+            TokenKind::IntrinsicLabel(label) => {
+                if label_to_assign.is_some() {
+                    panic!("multiple labels is not allowed");
+                }
+
+                if label.contains('.') {
+                    panic!("`.` is not allowed in the label name: {label}");
+                }
+
+                let name = make_label(&module_name, &label);
+                if labels_map.contains_key(&name) {
+                    panic!("duplicate label: {label}");
+                }
+
+                label_to_assign = Some((token.indentation, name));
+            }
+            TokenKind::IntrinsicImport(module) => {
+                if module == module_name {
+                    println!("[Warn] self import is weird, not an error but useless");
+                } else if local_imports.insert(module.clone(), false).is_some() {
+                    println!("[Warn] duplicate import `{module}` at {:?}", token.loc);
+                } else if let Entry::Vacant(e) = modules.entry(module.clone()) {
+                    e.insert(false);
                 }
             }
-            item_depths.push(get_depth($indent, $loc));
-            links.push(None);
-
-            idx += 1;
-        }};
-    }
-
-    while let Some((module_name, module_tokens)) = tokens_to_process.pop() {
-        let offset = items.len();
-
-        for token in module_tokens {
-            match token.kind {
-                TokenKind::Intrinsic(int) => {
-                    int_stack.push(int);
-                }
-                TokenKind::Option(phrase) => {
-                    register_item!(&module_name, token.indentation, token.loc);
-                    items.push(StateItem::Option(phrase));
-                }
-                TokenKind::Response(phrase) => {
-                    register_item!(&module_name, token.indentation, token.loc);
-                    items.push(StateItem::Response {
-                        phrase,
-                        options: Vec::new(),
-                    })
-                }
-                TokenKind::PhraseContinuation(text) => match items[offset..].last_mut() {
-                    Some(StateItem::Option(phrase) | StateItem::Response { phrase, .. }) => {
-                        phrase.push_str(&text);
-                    }
-                    None => panic!("lonely phrase is not allowed"),
-                },
-                TokenKind::Comment | TokenKind::SpaceLine => {}
-            }
-        }
-
-        link_state_items(
-            offset,
-            &mut items[offset..],
-            &mut links[offset..],
-            &item_depths[offset..],
-        );
-    }
-
-    for (item, label) in label_jumps.into_iter() {
-        if let Some(idx) = labels_map.get(&label) {
-            links[item] = Some(*idx);
-        } else {
-            panic!("label doesn't exist: {label}");
+            TokenKind::Comment | TokenKind::SpaceLine => {}
         }
     }
 
-    for (module, is_used) in modules {
+    let module_links = link_state_items(link_offset, &mut module_items, &item_depths);
+
+    for (import, is_used) in local_imports {
         if !is_used {
-            println!("[Warn] `{module}` imported but not used");
+            println!("[Warn] `{import}` was imported but never referenced");
         }
     }
 
-    Ok((items, links))
+
+    links.extend(module_links);
+    items.extend(module_items);
 }
 
 fn link_state_items(
-    offset: usize,
+    link_offset: usize,
     items: &mut [StateItem],
-    links: &mut [Option<usize>],
     item_depths: &[u32],
-) {
+) -> Vec<Option<usize>> {
+    let mut links = vec![None::<usize>; items.len()];
     let mut states = Vec::<usize>::new();
     let mut parents = HashMap::<usize, usize>::new();
     let mut sibling_idx = HashMap::<usize, u32>::new();
     let mut last_modified_state = None::<usize>;
 
+    // first iteration is linking items of the same branch and defining sibling-parent-child relationship
     for this_item in 0..items.len() {
         match items[this_item] {
-            StateItem::Response { .. } => {
+            StateItem::Jump | StateItem::Response { .. } => {
                 update_family(
                     this_item,
                     last_modified_state,
@@ -426,13 +482,14 @@ fn link_state_items(
                 );
 
                 if let Some(next @ None) = this_item.checked_sub(1).map(|i| &mut links[i]) {
-                    *next = Some(this_item + offset);
+                    *next = Some(this_item + link_offset);
                 }
 
                 states.push(this_item);
 
                 last_modified_state = Some(this_item);
             }
+            // only Option cannot define states by itself
             StateItem::Option { .. } => {
                 let Some(state) = states
                     .iter()
@@ -443,8 +500,12 @@ fn link_state_items(
                     panic!("could find a state definition for this option");
                 };
 
-                let StateItem::Response { options, .. } = &mut items[state] else {
-                    unreachable!();
+                let options = match &mut items[state] {
+                    StateItem::Response { options, .. } => options,
+                    StateItem::Jump => panic!(
+                        "I cannot assign options for `@jump` intrinsic, you must define response with `-` that will own those options"
+                    ),
+                    StateItem::Option(_) => unreachable!(),
                 };
 
                 options.push(this_item);
@@ -456,19 +517,24 @@ fn link_state_items(
 
     let mut opts = Vec::<usize>::new();
 
+    // second is finisher: links end of the branches to it's parent's next sibling
     for (i, state) in states.iter().copied().enumerate() {
         let mut next_item = None::<Option<usize>>;
 
-        {
-            let StateItem::Response { options, phrase } = &mut items[state] else {
-                unreachable!();
-            };
-            trim_end(phrase);
-            opts.extend_from_slice(options);
-        }
+        match &mut items[state] {
+            StateItem::Response { options, phrase } => {
+                trim_end(phrase);
+                opts.extend_from_slice(options);
+            }
+            StateItem::Jump => continue,
+            StateItem::Option(_) => unreachable!(),
+        };
 
         for item in std::iter::once(state).chain(opts.drain(..)) {
-            let (StateItem::Response { phrase, .. } | StateItem::Option(phrase)) = &mut items[item];
+            let (StateItem::Response { phrase, .. } | StateItem::Option(phrase)) = &mut items[item]
+            else {
+                unreachable!();
+            };
             trim_end(phrase);
 
             let next = &mut links[item];
@@ -485,13 +551,15 @@ fn link_state_items(
                         &sibling_idx,
                         item_depths,
                     )
-                    .map(|item_idx| item_idx + offset),
+                    .map(|item_idx| item_idx + link_offset),
                 );
             }
 
             *next = next_item.unwrap_or(None);
         }
     }
+
+    links
 }
 
 fn get_depth_from_indent(indentation: Indentation, single_indent: Indentation, loc: Loc) -> u32 {
