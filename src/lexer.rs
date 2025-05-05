@@ -491,11 +491,19 @@ fn link_state_items(
             }
             // only Option cannot define states by itself
             StateItem::Option { .. } => {
-                let Some(state) = states
-                    .iter()
+                let Some(state) = (0..items[..this_item].len())
                     .rev()
-                    .find(|s| item_depths[**s] == item_depths[this_item])
-                    .copied()
+                    .find_map(|i| {
+                        if item_depths[i] < item_depths[this_item] {
+                            panic!("couldn't find an option handler for {this_item} on this depth");
+                        } else if let StateItem::Option(_) = &items[i] {
+                            None
+                        } else if item_depths[i] == item_depths[this_item] {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
                 else {
                     panic!("could find a state definition for this option");
                 };

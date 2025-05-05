@@ -219,7 +219,7 @@ const TEST_CONVO: &str = "
 
 - 16 -> 17
     - 17 -> 19
-> 18 -> 19
+    > 18 -> 19
 
 - 19 -> 20 which is a jump to a test.mur file -> 21
 # @jump test.Test // 20 -> 21 which is in test.mur file
@@ -227,5 +227,6 @@ const TEST_CONVO: &str = "
 
 fn main() {
     let mut convo = Conversation::from_source(TEST_CONVO, "main").unwrap();
+    // println!("{:?}", convo.options_in_state(&13).collect::<Vec<_>>());
     println!("{convo}");
 }
