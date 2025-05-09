@@ -85,7 +85,7 @@ Here you can get a sense of the logic of state transitioning:
 ```
 
 ## Builtin functions
-NOTE: Function names aren't final..
+NOTE: Function names aren't final.. I design the language ahead, so most of the things here is not ready.
 
 Each function starts with `@` and operates on next response or option:
 
@@ -120,3 +120,52 @@ In the `angry.mur` file:
 - Come closer..
 ```
 
+TODO: If items are indented under the `@as` function, *murmur* will isolate them from the main conversation. They act as local modules and remain inactive unless you jump to the owner label:
+```
+@as Condemnation
+    - ...
+    @jump End
+
+@as Start
+- ..?
+> She told me she is 18!
+    @jump Condemnation
+```
+
+- TODO: `@call <func>`, where `func` is your `fn(&mut YourCustomState) -> _`, will ignore the return value.
+
+- TODO: `@if <func>`, `@elif <func>` and `@else`, where `func` is your `fn(&mut YourCustomState) -> bool`.
+
+- TODO: `@return` will undo the previous `@jump`, continuing from the next item after the jump.
+
+- TODO: `@{<func>}` enables string interpolation in phrases (responses and options), where `func` is your `fn(&mut YourCustomState) -> AnyDisplayableValue`:
+```
+- You are @{random_insult}!
+```
+
+- TODO: `@hide [labels]`/`@show [labels]` will disable/enable the specified items, causing them to be skipped. If no labels are specified, they will disable/enable the parent item:
+```
+# Useful for this kind of "wiki" style dialogues
+
+@as useful_convo
+- What do you want to know?
+
+> How much?
+    - Not much.
+        @hide
+        @jump useful_convo
+
+> Where?
+    - Somewhere near.
+        @hide
+        @jump useful_convo
+```
+
+- TODO (maybe): `@template [args]` is a macro to generate *murmur* chunks:
+```
+@template jump_if $condition $label
+    @if $condition
+        @jump $label
+
+@jump_if too_old grave
+```
