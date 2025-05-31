@@ -139,7 +139,7 @@ Redirects the item to the specified label:
 ```
 
 #### `@import <module>`
-Defines a `<module>` namespace and makes all labels from the `<module>.mur` file available for use, so you can jump in there with `@to <module>.<label>`. The import is **lazy** - it will not be loaded or parsed unless you use it:
+Defines a `<module>` namespace and makes all labels from the `<module>.mur` file available for use, so you can jump in there. The import is **lazy** - it will not be loaded or parsed unless you use it:
 ```
 @import angry
 
@@ -204,7 +204,7 @@ within a string interpolation, chunk is expanded as a plain string:
 
 - Man, you smell like {.smell}!
 
-@ .bad_smell # parsing error if `psina` is not defined
+@ .smell # parsing error if `psina` is not defined
 ```
 
 
