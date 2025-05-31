@@ -482,7 +482,10 @@ fn parse_module(
                         (item_depth[i] == item_depth[this_item]).then_some(Ok(i))
                     })
                 else {
-                    eprintln!("{:?} couldn't find an option handler for {phrase:?} on this depth", token.loc);
+                    eprintln!(
+                        "{:?} couldn't find an option handler for {phrase:?} on this depth",
+                        token.loc
+                    );
                     return Err(());
                 };
 
@@ -768,7 +771,7 @@ fn link_state_items(
         if let Some(prev_item_link @ None) =
             item.checked_sub(1).map(|prev_item| &mut links[prev_item])
         {
-            *prev_item_link = Some(item);
+            *prev_item_link = Some(item + link_offset);
         }
 
         states.push(item);

@@ -154,20 +154,28 @@ impl Conversation {
         loop {
             match &self.items[self.current] {
                 _ if !self.vis[self.current] => self.current = self.links[self.current]?,
-                StateItem::Response { .. } => return Some(()),
+                StateItem::Response { .. } => {
+                    // println!("found next response");
+                    return Some(());
+                }
                 StateItem::Show(items) => {
                     for item in items {
+                    //     println!("showing item {item}");
                         self.vis[*item] = true;
                     }
                     self.current = self.links[self.current]?;
                 }
                 StateItem::Hide(items) => {
                     for item in items {
+                    //     println!("hiding item {item}");
                         self.vis[*item] = false;
                     }
                     self.current = self.links[self.current]?;
                 }
-                StateItem::Jump(target) =>  self.current = *target,
+                StateItem::Jump(target) => {
+                    // println!("jumping to {target}");
+                    self.current = *target;
+                }
                 StateItem::Option { .. } => unreachable!(),
             }
         }
@@ -175,23 +183,28 @@ impl Conversation {
 
     fn options_indices(&self) -> impl Iterator<Item = usize> {
         match &self.items[self.current] {
-            StateItem::Response { options, .. } => {
-                options.iter().filter(|opt| self.vis[**opt]).copied()
-            }
+            StateItem::Response { options, .. } => options,
+            StateItem::Option { .. } => std::slice::from_ref(&self.current),
             _ => unreachable!(),
         }
+        .iter()
+        .filter(|opt| self.vis[**opt])
+        .copied()
     }
 }
 
 fn run(mut conv: Conversation) -> std::io::Result<()> {
     use std::io::Write;
-    // println!("{:#?}", conv.items);
+
+    for i in 0..conv.items.len() {
+        println!("{:?} -> {:?}", conv.items[i], conv.links[i]);
+    }
 
     let out = &mut std::io::stdout();
     let mut input = String::new();
 
     loop {
-        println!("{:#?}", conv.vis);
+        // println!("{:#?}", conv.vis);
         let state = conv.current;
 
         write!(out, "- ")?;
@@ -244,16 +257,16 @@ const TEST_CONVO: &str = "
 @import test
 
 @as suka
-    - 23 -> jump to 0, which is jump to 1
+    - 23 -> 24, which is a jump to `start`
     @jump start # 24 -> 0
 
+@hide tutu
 @jump suka # 0 -> 23
 
 @as start
 - 1 -> 16
+@as tutu
 > 2 -> 3
-    @hide start tutu
-
     - 3 -> 16
     > 4 -> 5
         - 5 -> 16
@@ -269,12 +282,8 @@ const TEST_CONVO: &str = "
     - 14 -> 16
     > 15 -> 16
 
-@as tutu
-@jump start
 
 - 16 -> 17
-@show tutu start
-@jump tutu
 
 - 17 -> 18
     - 18 -> 20
