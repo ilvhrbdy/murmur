@@ -260,8 +260,7 @@ const TEST_CONVO: &str = "
     - 23 -> 24, which is a jump to `start`
     @jump start # 24 -> 0
 
-@hide tutu
-@jump suka # 0 -> 23
+@jump tutu # 0 -> 23
 
 @as start
 - 1 -> 16

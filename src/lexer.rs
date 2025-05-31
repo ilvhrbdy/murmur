@@ -248,7 +248,7 @@ pub(super) enum StateItem {
 struct ParserData {
     single_indentation: Indentation,
     labels_map: HashMap<String, usize>,
-    label_jumps: HashMap<usize, String>, // to store all jumps, before all labels are defined
+    label_jumps: HashMap<usize, (Loc, String)>, // to store all jumps, before all labels are defined
     label_vis_changes: HashMap<usize, Vec<(Loc, String)>>, // to store args for `hide` or `show` funcs, before all labels are defined
 
     entry_point: Option<usize>,
@@ -289,15 +289,21 @@ pub(super) fn parse_tokens_into_items(
         return Err(());
     }
 
-    for (jump_item, label) in parser.label_jumps {
-        let StateItem::Jump(location) = &mut parser.items[jump_item] else {
-            unreachable!()
-        };
+    for (jump_item, (loc, label)) in parser.label_jumps {
 
         // TODO: store location
         let Some(target_item) = parser.labels_map.get(&label) else {
-            eprintln!("label doesn't exist: {label}");
+            eprintln!("{loc:?} label doesn't exist: {label}");
             return Err(());
+        };
+
+        if let StateItem::Option {..} = parser.items[*target_item] {
+            eprintln!("{loc:?} jumping into option is not allowed :(");
+            return Err(());
+        }
+
+        let StateItem::Jump(location) = &mut parser.items[jump_item] else {
+            unreachable!()
         };
 
         *location = *target_item;
@@ -518,7 +524,7 @@ fn parse_module(
                     return Err(());
                 }
 
-                let Some((_, label)) = args.pop() else {
+                let Some((loc, label)) = args.pop() else {
                     eprintln!(
                         "{loc:?} expected label for `jump` function",
                         loc = token.loc
@@ -571,7 +577,7 @@ fn parse_module(
 
                 assert!(
                     label_jumps
-                        .insert(module_items.len() + link_offset, jump_target)
+                        .insert(module_items.len() + link_offset, (loc, jump_target))
                         .is_none(),
                     "it seems like jump got overwritten, is it even possilbe?"
                 );
