@@ -281,7 +281,7 @@ const TEST_CONVO: &str = "
 
 @as call
 - suka
-@ aboba
+@aboba
 @jump call # 0 -> 23
 
 @as start

@@ -737,6 +737,11 @@ fn parse_module<State>(
                 let args = args.into_iter().map(|(_, a)| a).collect::<Vec<String>>();
 
                 if is_comptime_call {
+                    if label_to_assign.is_some() {
+                        eprintln!("{:?} you cannot assign label for compile time function, it will not be present at runtime, bruh, obviously", token.loc);
+                        return Err(());
+                    }
+
                     (funcs[func])(state, &args);
                     continue;
                 }
