@@ -1,8 +1,21 @@
 mod lexer;
 mod utils;
 
-use lexer::StateItem;
+use lexer::{Func, StateItem};
+use std::collections::HashMap;
 use std::path::Path;
+
+// TODO: test funcs + comptime funcs
+
+
+
+
+
+
+
+
+
+
 
 // TODO: need to do something with cases like this:
 //
@@ -44,19 +57,6 @@ use std::path::Path;
 //     Static(String),
 //     FromFunction(usize),
 // }
-// TODO:
-//      @ hide [zero or miltiple space separated args]
-//      and
-//      @ show [zero or miltiple space separated args]
-//
-//      that will manipulate the vis of the item
-//      hide or show without arguments is going to operate on previous item, so something like this is possible:
-//          @as lbl
-//          - What?
-//          > Nothing
-//              @hide
-//              @jump lbl # jumping back to this state, but option will be excluded
-//
 // TODO: compile time "once" function execution with `@ !func` or `@{ !func }`
 // TODO: @if @elif @else
 // TODO: function mapping and calling via `@ func` or @{ func } or comp time version with "!"
@@ -74,7 +74,10 @@ use std::path::Path;
 //      maybe i need to be strict with this kind of shit?
 
 #[derive(Debug)]
-pub struct Conversation {
+pub struct Conversation<State> {
+    state: State,
+    funcs: Vec<Func<State>>,
+
     vis: Vec<bool>,
     items: Vec<StateItem>,
     links: Vec<Option<usize>>,
@@ -82,19 +85,29 @@ pub struct Conversation {
     current: usize,
 }
 
-impl Conversation {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, ()> {
+impl<State> Conversation<State> {
+    pub fn load(
+        path: impl AsRef<Path>,
+        funcs_map: HashMap<String, Func<State>>,
+        state: State,
+    ) -> Result<Self, ()> {
         let path = path.as_ref();
         let file_name = path.file_name().unwrap().to_str().unwrap();
         let module_name = file_name.strip_suffix(".mur").unwrap_or(file_name);
         let src = utils::read_mur_file(module_name)?;
 
-        Self::from_source(src, module_name)
+        Self::from_source(src, module_name, funcs_map, state)
     }
 
-    pub fn from_source(src: impl AsRef<str>, module_name: &str) -> Result<Self, ()> {
+    pub fn from_source(
+        src: impl AsRef<str>,
+        module_name: &str,
+        funcs_map: HashMap<String, Func<State>>,
+        mut state: State,
+    ) -> Result<Self, ()> {
         let tokens = lexer::tokenize(src.as_ref());
-        let (items, links) = lexer::parse_tokens_into_items(module_name, tokens)?;
+        let (items, links, funcs) =
+            lexer::parse_tokens_into_items(module_name, tokens, funcs_map, &mut state)?;
 
         if items.is_empty() {
             eprintln!("you must define at least one state");
@@ -102,6 +115,8 @@ impl Conversation {
         }
 
         let mut it = Self {
+            state,
+            funcs,
             vis: vec![true; items.len()],
             current: 0,
             items,
@@ -160,14 +175,14 @@ impl Conversation {
                 }
                 StateItem::Show(items) => {
                     for item in items {
-                    //     println!("showing item {item}");
+                        //     println!("showing item {item}");
                         self.vis[*item] = true;
                     }
                     self.current = self.links[self.current]?;
                 }
                 StateItem::Hide(items) => {
                     for item in items {
-                    //     println!("hiding item {item}");
+                        //     println!("hiding item {item}");
                         self.vis[*item] = false;
                     }
                     self.current = self.links[self.current]?;
@@ -175,6 +190,10 @@ impl Conversation {
                 StateItem::Jump(target) => {
                     // println!("jumping to {target}");
                     self.current = *target;
+                }
+                StateItem::FunctionCall { func, args } => {
+                    (self.funcs[*func])(&mut self.state, args);
+                    self.current = self.links[self.current]?;
                 }
                 StateItem::Option { .. } => unreachable!(),
             }
@@ -193,12 +212,12 @@ impl Conversation {
     }
 }
 
-fn run(mut conv: Conversation) -> std::io::Result<()> {
+fn run<State>(mut conv: Conversation<State>) -> std::io::Result<()> {
     use std::io::Write;
 
-    for i in 0..conv.items.len() {
-        println!("{:?} -> {:?}", conv.items[i], conv.links[i]);
-    }
+    // for i in 0..conv.items.len() {
+    //     println!("{:?} -> {:?}", conv.items[i], conv.links[i]);
+    // }
 
     let out = &mut std::io::stdout();
     let mut input = String::new();
@@ -258,9 +277,12 @@ const TEST_CONVO: &str = "
 
 @as suka
     - 23 -> 24, which is a jump to `start`
-    @jump start # 24 -> 0
+    @jump test.Test # 24 -> 0
 
-@jump tutu # 0 -> 23
+@as call
+- suka
+@ aboba
+@jump call # 0 -> 23
 
 @as start
 - 1 -> 16
@@ -292,8 +314,13 @@ const TEST_CONVO: &str = "
 @jump test.Test # 23 -> 24 which is in test.mur file
 ";
 
+fn test(_: &mut (), args: &[String]) {
+    println!("your args: {args:?}");
+}
+
 fn main() {
-    let Ok(convo) = Conversation::from_source(TEST_CONVO, "main") else {
+    let funcs = HashMap::<String, Func<()>>::from([("aboba".to_string(), test as _)]);
+    let Ok(convo) = Conversation::from_source(TEST_CONVO, "main", funcs, ()) else {
         return;
     };
 

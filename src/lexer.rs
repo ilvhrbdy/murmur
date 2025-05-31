@@ -242,6 +242,7 @@ pub(super) enum StateItem {
     Jump(usize),
     Hide(Vec<usize>),
     Show(Vec<usize>),
+    FunctionCall { func: usize, args: Vec<String> },
 }
 
 #[derive(Default)]
@@ -260,12 +261,25 @@ struct ParserData {
     links: Vec<Option<usize>>,
 }
 
-pub(super) fn parse_tokens_into_items(
+pub(super) type Func<State> = fn(&mut State, args: &[String]);
+
+#[allow(clippy::type_complexity)]
+pub(super) fn parse_tokens_into_items<State>(
     main_module: &str,
     tokens: Vec<Token>,
-) -> Result<(Vec<StateItem>, Vec<Option<usize>>), ()> {
+    funcs_map_defs: HashMap<String, Func<State>>,
+    state: &mut State,
+) -> Result<(Vec<StateItem>, Vec<Option<usize>>, Vec<Func<State>>), ()> {
     let mut parser = ParserData::default();
     let mut failed = false;
+
+    let mut funcs = Vec::new();
+    let mut funcs_map = HashMap::new();
+
+    for (fn_name, func) in funcs_map_defs {
+        funcs_map.insert(fn_name, funcs.len());
+        funcs.push(func);
+    }
 
     // TODO: avoid second allocation for the name
     parser.modules.insert(main_module.into(), true);
@@ -274,7 +288,7 @@ pub(super) fn parse_tokens_into_items(
         .push((main_module.into(), HashMap::new(), tokens));
 
     while !parser.load_queue.is_empty() {
-        let Ok(parsed_module_name) = parse_module(&mut parser) else {
+        let Ok(parsed_module_name) = parse_module(&mut parser, &funcs_map, &funcs, state) else {
             failed = true;
             continue;
         };
@@ -290,15 +304,14 @@ pub(super) fn parse_tokens_into_items(
     }
 
     for (jump_item, (loc, label)) in parser.label_jumps {
-
         // TODO: store location
         let Some(target_item) = parser.labels_map.get(&label) else {
             eprintln!("{loc:?} label doesn't exist: {label}");
             return Err(());
         };
 
-        if let StateItem::Option {..} = parser.items[*target_item] {
-            eprintln!("{loc:?} jumping into option is not allowed :(");
+        if let StateItem::Option { .. } = parser.items[*target_item] {
+            eprintln!("{loc:?} jumping on options is not allowed :(");
             return Err(());
         }
 
@@ -331,10 +344,10 @@ pub(super) fn parse_tokens_into_items(
         }
     }
 
-    Ok((parser.items, parser.links))
+    Ok((parser.items, parser.links, funcs))
 }
 
-fn parse_module(
+fn parse_module<State>(
     ParserData {
         load_queue,
         modules,
@@ -346,6 +359,9 @@ fn parse_module(
         items,
         links,
     }: &mut ParserData,
+    funcs_map: &HashMap<String, usize>,
+    funcs: &[Func<State>],
+    state: &mut State,
 ) -> Result<String, ()> {
     let link_offset = items.len();
     let Some((module_name, mut local_imports, tokens)) = load_queue.pop() else {
@@ -433,13 +449,14 @@ fn parse_module(
                 }
 
                 // TODO: i thought that i could just push locala imports but at this point not all of the imports availabel
-                //          because @import may be located later in the file (after the block)
+                //          because @import may be located later in the file (after the block), which is not a big deal?
                 load_queue.push((module_name.clone(), local_imports.clone(), block));
 
                 continue;
             } else if label_depth > token_depth {
                 eprintln!(
-                    "label must be either a parent of next item to define a block or to be at the same indentation depth as the next item"
+                    "{:?} label must be either a parent of next item to define a block or to be at the same indentation depth as the next item",
+                    token.loc
                 );
                 return Err(());
             }
@@ -546,7 +563,7 @@ fn parse_module(
                             *is_used = true;
                         } else {
                             eprintln!(
-                                "`{:?} {import_name}` is not imported, so can't access `{import_label}`",
+                                "{:?} `{import_name}` is not imported, so can't access `{import_label}`",
                                 token.loc
                             );
                             return Err(());
@@ -703,7 +720,29 @@ fn parse_module(
                     _ => unreachable!(),
                 }
             }
-            TokenKind::Function { name, .. } => todo!("custom function: {name}"),
+            TokenKind::Function { name, args } => {
+                let (is_comptime_call, fn_name) = name
+                    .strip_prefix('!')
+                    .map_or((false, name.as_str()), |rest| (true, rest));
+
+                let Some(func) = funcs_map.get(fn_name).copied() else {
+                    eprintln!("{:?} function `{fn_name}` is undefined", token.loc);
+                    return Err(());
+                };
+
+                if !func_signature_is_valid((&token.loc, fn_name), &args, &[]) {
+                    return Err(());
+                }
+
+                let args = args.into_iter().map(|(_, a)| a).collect::<Vec<String>>();
+
+                if is_comptime_call {
+                    (funcs[func])(state, &args);
+                    continue;
+                }
+
+                register_state_item!(true, StateItem::FunctionCall { func, args })
+            }
         }
     }
 
@@ -721,13 +760,13 @@ fn parse_module(
     Ok(module_name)
 }
 
+const RESTRICTED_CHARS: &[char] = &['!', '@', '-', '>', '.'];
+
 fn func_signature_is_valid<'s>(
     func: (&'s Loc, &'s str),
     args: &'s [(Loc, String)],
     exceptions: &'s [char],
 ) -> bool {
-    const RESTRICTED_CHARS: &[char] = &['!', '@', '-', '>', '.'];
-
     let mut valid = true;
     let errors = std::iter::once(func)
         .chain(args.iter().map(|(loc, arg)| (loc, arg.as_str())))
@@ -788,7 +827,10 @@ fn link_state_items(
 
         let maybe_options = match &items[this_state] {
             StateItem::Response { options, .. } => Some(options),
-            StateItem::Jump(_) | StateItem::Hide(_) | StateItem::Show(_) => None,
+            StateItem::FunctionCall { .. }
+            | StateItem::Jump(_)
+            | StateItem::Hide(_)
+            | StateItem::Show(_) => None,
             StateItem::Option { .. } => unreachable!(),
         };
 
