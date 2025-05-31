@@ -238,20 +238,22 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
 #[derive(Debug)]
 pub(super) enum StateItem {
     Response { phrase: String, options: Vec<usize> },
-    Option { handler: usize, phrase: String },
-    Jump,
-    OptionsBlock(Vec<usize>),
+    Option { phrase: String },
+    Jump(usize),
+    Hide(Vec<usize>),
+    Show(Vec<usize>),
 }
 
 #[derive(Default)]
 struct ParserData {
     single_indentation: Indentation,
     labels_map: HashMap<String, usize>,
-    label_jumps: HashMap<usize, String>, // to store all jumps before all labels are defined
+    label_jumps: HashMap<usize, String>, // to store all jumps, before all labels are defined
+    label_vis_changes: HashMap<usize, Vec<(Loc, String)>>, // to store args for `hide` or `show` funcs, before all labels are defined
 
     entry_point: Option<usize>,
     modules: HashMap<String, bool>, // keep track of what is already imported
-    load_queue: Vec<(String, HashMap<String, bool>, Vec<Token>)>,
+    load_queue: Vec<(String, HashMap<String, bool>, Vec<Token>)>, // module name, local imports (if parsing an `as` block), tokens
 
     // Result
     items: Vec<StateItem>,
@@ -288,19 +290,38 @@ pub(super) fn parse_tokens_into_items(
     }
 
     for (jump_item, label) in parser.label_jumps {
-        assert!(matches!(&parser.items[jump_item], StateItem::Jump));
+        let StateItem::Jump(location) = &mut parser.items[jump_item] else {
+            unreachable!()
+        };
 
-        if let Some(target_item) = parser.labels_map.get(&label) {
-            parser.links[jump_item] = Some(*target_item);
-        } else {
+        // TODO: store location
+        let Some(target_item) = parser.labels_map.get(&label) else {
             eprintln!("label doesn't exist: {label}");
             return Err(());
+        };
+
+        *location = *target_item;
+    }
+
+    for (vis_change_item, labels) in parser.label_vis_changes {
+        let (StateItem::Hide(items) | StateItem::Show(items)) = &mut parser.items[vis_change_item]
+        else {
+            unreachable!();
+        };
+
+        for (loc, label) in labels {
+            let Some(target_item) = parser.labels_map.get(&label) else {
+                eprintln!("{loc:?} label doesn't exist: {label}");
+                return Err(());
+            };
+
+            items.push(*target_item);
         }
     }
 
     for (module, is_used) in parser.modules {
         if !is_used {
-            eprintln!("[Warn] `{module}` was not loaded");
+            eprintln!("[Warn] `{module}` was not loaded, because it was never referenced anywhere");
         }
     }
 
@@ -314,6 +335,7 @@ fn parse_module(
         single_indentation,
         labels_map,
         label_jumps,
+        label_vis_changes,
         entry_point,
         items,
         links,
@@ -346,16 +368,20 @@ fn parse_module(
         )
     };
 
-    let mut module_items = Vec::<StateItem>::new();
+    let mut parents = Vec::<Option<usize>>::new();
+    let mut sibling_idx = Vec::<u32>::new();
     let mut item_depth = Vec::<u32>::new();
+
+    let mut module_items = Vec::<StateItem>::new();
     let mut label_to_assign = None::<(u32, String)>;
     let mut tokens = tokens.into_iter().peekable();
 
     while let Some(token) = tokens.next() {
+        let this_item = module_items.len() + link_offset;
         let token_depth = get_depth(token.indentation, token.loc);
 
-        macro_rules! push_state_item {
-            () => {{
+        macro_rules! register_state_item {
+            ($update_family:expr $(, $item:expr)?) => {{
                 if let Some(StateItem::Option { phrase, .. } | StateItem::Response { phrase, .. }) =
                     module_items.last_mut()
                 {
@@ -363,20 +389,27 @@ fn parse_module(
                 }
 
                 if let Some((_, label)) = label_to_assign.take() {
-                    let _ = labels_map.insert(label, module_items.len() + link_offset);
+                    let _ = labels_map.insert(label, this_item);
                 }
 
                 item_depth.push(token_depth);
-            }};
+                if $update_family {
+                    let this = module_items.len();
+                    welcome_to_the_family(
+                        this,
+                        this.checked_sub(1),
+                        &mut parents,
+                        &mut sibling_idx,
+                        &item_depth,
+                    );
+                }
 
-            ($item:expr) => {{
-                push_state_item!();
-                module_items.push($item);
+                $(module_items.push($item);)?
             }};
         }
 
-        // create labeled block
         if let Some((label_depth, _)) = label_to_assign {
+            // create labeled block
             if label_depth < token_depth {
                 let (label_depth, label) = label_to_assign.take().unwrap();
                 let mut block = vec![
@@ -409,13 +442,6 @@ fn parse_module(
         match token.kind {
             TokenKind::IsolatedBlock(label) => {
                 let _ = labels_map.insert(label, module_items.len() + link_offset);
-                if let Some(Token {
-                    kind: TokenKind::Option(_),
-                    ..
-                }) = tokens.peek()
-                {
-                    push_state_item!(StateItem::OptionsBlock(Vec::new()));
-                }
             }
             TokenKind::PhraseContinuation(text) => match module_items.last_mut() {
                 Some(StateItem::Option { phrase, .. } | StateItem::Response { phrase, .. }) => {
@@ -434,57 +460,58 @@ fn parse_module(
                     *entry_point = Some(module_items.len() + link_offset);
                 }
 
-                push_state_item!(StateItem::Response {
-                    phrase,
-                    options: Vec::new(),
-                });
+                register_state_item!(
+                    true,
+                    StateItem::Response {
+                        phrase,
+                        options: Vec::new(),
+                    }
+                );
             }
             TokenKind::Option(phrase) => {
-                // TODO: push OptionsBlock if option is labeled
-                let this_option = module_items.len() + link_offset;
-                push_state_item!();
+                register_state_item!(false);
+
                 let Some(Ok(opt_handler)) = (0..module_items.len())
                     .rev()
                     .filter(|i| !matches!(&module_items[*i], StateItem::Option { .. }))
                     .find_map(|i| {
-                        if item_depth[i] < item_depth[this_option] {
+                        if item_depth[i] < item_depth[this_item] {
                             return Some(Err(()));
                         }
 
-                        (item_depth[i] == item_depth[this_option]).then_some(Ok(i))
+                        (item_depth[i] == item_depth[this_item]).then_some(Ok(i))
                     })
                 else {
-                    eprintln!("couldn't find an option handler for {phrase:?} on this depth");
+                    eprintln!("{:?} couldn't find an option handler for {phrase:?} on this depth", token.loc);
                     return Err(());
                 };
 
-                module_items.push(StateItem::Option {
-                    phrase,
-                    handler: opt_handler,
-                });
+                sibling_idx.push(sibling_idx[opt_handler]);
+                parents.push(Some(opt_handler));
+                module_items.push(StateItem::Option { phrase });
 
                 match &mut module_items[opt_handler] {
-                    StateItem::Response { options, .. } => options.push(this_option),
-                    StateItem::OptionsBlock(options) => options.push(this_option),
-                    StateItem::Jump => {
+                    StateItem::Response { options, .. } => options.push(this_item),
+                    StateItem::Option { .. } => unreachable!(),
+                    _ => {
                         eprintln!(
-                            "I cannot assign options for `@jump` intrinsic, you must define response with `-` that will own those options"
+                            "{loc:?} options can only belong to responses, defined with `-`",
+                            loc = token.loc,
                         );
                         return Err(());
                     }
-                    StateItem::Option { .. } => unreachable!(),
                 };
             }
             TokenKind::Function { name, mut args } if name == "jump" => {
-                if !func_signature_is_valid((&token.loc, &name), &args, &['.']) {
-                    return Err(())
-                }
-
                 if args.len() > 1 {
                     eprintln!(
                         "{loc:?} too many arguments for `jump` function, expected only one label",
                         loc = token.loc
                     );
+                    return Err(());
+                }
+
+                if !func_signature_is_valid((&token.loc, &name), &args, &['.']) {
                     return Err(());
                 }
 
@@ -499,14 +526,20 @@ fn parse_module(
                 let mut parts = label.split('.');
                 let jump_target = match (parts.next(), parts.next(), parts.next()) {
                     (.., Some(_)) => {
-                        eprintln!("{:?} invalid item access syntax, path may only contain one dot", token.loc);
+                        eprintln!(
+                            "{:?} invalid item access syntax, path may only contain one dot",
+                            token.loc
+                        );
                         return Err(());
                     }
                     (Some(import_name), Some(import_label), _) => {
                         if let Some(is_used) = local_imports.get_mut(import_name) {
                             *is_used = true;
                         } else {
-                            eprintln!("`{:?} {import_name}` is not imported, so can't access `{import_label}`", token.loc);
+                            eprintln!(
+                                "`{:?} {import_name}` is not imported, so can't access `{import_label}`",
+                                token.loc
+                            );
                             return Err(());
                         }
 
@@ -516,12 +549,9 @@ fn parse_module(
                         };
 
                         if !*is_loaded {
-                            let src =
-                                match crate::utils::read_mur_file(&format!("{import_name}.mur")) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
+                            let src = crate::utils::read_mur_file(&format!("{import_name}.mur"))?;
                             let import_tokens = tokenize(&src);
+
                             load_queue.push((
                                 import_name.to_string(),
                                 HashMap::new(),
@@ -543,19 +573,19 @@ fn parse_module(
                     "it seems like jump got overwritten, is it even possilbe?"
                 );
 
-                push_state_item!(StateItem::Jump);
+                register_state_item!(true, StateItem::Jump(0));
             }
             TokenKind::Function { name, mut args } if name == "as" => {
-                if !func_signature_is_valid((&token.loc, &name), &args, &[]) {
-                    return Err(())
-                }
-
                 if args.len() > 1 {
                     let (loc, _) = args[1];
 
                     eprintln!(
                         "{loc:?} too many arguments for `as` function, expected only one label",
                     );
+                    return Err(());
+                }
+
+                if !func_signature_is_valid((&token.loc, &name), &args, &[]) {
                     return Err(());
                 }
 
@@ -568,12 +598,12 @@ fn parse_module(
                 };
 
                 if label_to_assign.is_some() {
-                    eprintln!("standalone labels is not allowed");
+                    eprintln!("function `as` cannot be labeled");
                     return Err(());
                 }
 
-                if label.contains('.') {
-                    eprintln!("`.` is not allowed in the label name: {label}");
+                if tokens.peek().is_none() {
+                    eprintln!("standalone `as` function is not allowed");
                     return Err(());
                 }
 
@@ -587,13 +617,21 @@ fn parse_module(
                 label_to_assign = Some((token_depth, name));
             }
             TokenKind::Function { name, mut args } if name == "import" => {
-                if !func_signature_is_valid((&token.loc, &name), &args, &[]) {
-                    return Err(())
-                }
-
                 if args.len() > 1 {
                     eprintln!(
                         "{loc:?} too many arguments for `import` function, expected only one module name",
+                        loc = token.loc
+                    );
+                    return Err(());
+                }
+
+                if !func_signature_is_valid((&token.loc, &name), &args, &[]) {
+                    return Err(());
+                }
+
+                if label_to_assign.is_some() {
+                    eprintln!(
+                        "{loc:?} cannot assign label to the `import` function",
                         loc = token.loc
                     );
                     return Err(());
@@ -608,22 +646,65 @@ fn parse_module(
                 };
 
                 if module.trim().is_empty() {
-                    eprintln!("you didn't specify import name at {:?}", token.loc);
+                    eprintln!("{:? }you didn't specify import name", token.loc);
                     return Err(());
                 } else if module == module_name {
-                    eprintln!("self import is weird");
+                    eprintln!("{:?} self import is weird", token.loc);
                     return Err(());
-                } else if local_imports.insert(module.clone(), false).is_some() {
-                    eprintln!("[Warn] duplicate import `{module}` at {:?}", token.loc);
-                } else if let Entry::Vacant(e) = modules.entry(module.clone()) {
-                    e.insert(false);
+                } else if local_imports.contains_key(&module) {
+                    eprintln!("{:?} duplicate import `{module}`", token.loc);
+                    return Err(());
+                } else {
+                    local_imports.insert(module.clone(), false);
+                    if let Entry::Vacant(e) = modules.entry(module.clone()) {
+                        e.insert(false);
+                    }
+                }
+            }
+            TokenKind::Function { name, mut args } if name == "hide" || name == "show" => {
+                if !func_signature_is_valid((&token.loc, &name), &args, &['.']) {
+                    return Err(());
+                }
+
+                register_state_item!(true);
+
+                let target_items = if args.is_empty() {
+                    let Some(parent) = parents[this_item] else {
+                        eprintln!(
+                            "{:?} this `hide` function without arguments affect it's parent, which is not present in our case :(",
+                            token.loc
+                        );
+                        return Err(());
+                    };
+
+                    vec![parent]
+                } else {
+                    for (_, label) in &mut args {
+                        *label = make_label(&module_name, label);
+                    }
+
+                    let len = args.len();
+                    label_vis_changes.insert(this_item, args);
+                    Vec::with_capacity(len)
+                };
+
+                match name.as_str() {
+                    "hide" => module_items.push(StateItem::Hide(target_items)),
+                    "show" => module_items.push(StateItem::Show(target_items)),
+                    _ => unreachable!(),
                 }
             }
             TokenKind::Function { name, .. } => todo!("custom function: {name}"),
         }
     }
 
-    let module_links = link_state_items(link_offset, &mut module_items, &item_depth);
+    let module_links = link_state_items(
+        link_offset,
+        &mut module_items,
+        &item_depth,
+        &parents,
+        &sibling_idx,
+    );
 
     links.extend(module_links);
     items.extend(module_items);
@@ -631,13 +712,13 @@ fn parse_module(
     Ok(module_name)
 }
 
-const RESTRICTED_CHARS: &[char] = &['!', '@', '-', '>', '.'];
-
 fn func_signature_is_valid<'s>(
     func: (&'s Loc, &'s str),
     args: &'s [(Loc, String)],
     exceptions: &'s [char],
 ) -> bool {
+    const RESTRICTED_CHARS: &[char] = &['!', '@', '-', '>', '.'];
+
     let mut valid = true;
     let errors = std::iter::once(func)
         .chain(args.iter().map(|(loc, arg)| (loc, arg.as_str())))
@@ -670,20 +751,16 @@ fn func_signature_is_valid<'s>(
 fn link_state_items(
     link_offset: usize,
     items: &mut [StateItem],
-    item_depth: &[u32],
+    items_depth: &[u32],
+    parents: &[Option<usize>],
+    sibling_idx: &[u32],
 ) -> Vec<Option<usize>> {
     let mut links = vec![None::<usize>; items.len()];
-    let mut parents = HashMap::<usize, usize>::new(); // excluding option items
-    let mut sibling_idx = HashMap::<usize, u32>::new(); // excluding option items
-
-    let mut last_modified = None::<usize>;
     let mut states = Vec::<usize>::new();
 
     for (item, kind) in items.iter().enumerate() {
         // filter out options,
-        if let StateItem::Option { handler, .. } = kind {
-            last_modified = Some(*handler);
-
+        if let StateItem::Option { .. } = kind {
             continue;
         }
 
@@ -694,42 +771,39 @@ fn link_state_items(
             *prev_item_link = Some(item);
         }
 
-        // push it's parent and sibling counter
-        update_family(
-            item,
-            last_modified,
-            &mut parents,
-            &mut sibling_idx,
-            item_depth,
-        );
-
         states.push(item);
     }
 
     for i in 0..states.len() {
         let this_state = states[i];
 
-        let (mut searched, mut found_next_item) = (false, None::<usize>);
-
-        let options = match &items[this_state] {
-            StateItem::OptionsBlock(options) => options,
-            StateItem::Response { options, .. } => options,
-            StateItem::Jump => continue, // already linked
+        let maybe_options = match &items[this_state] {
+            StateItem::Response { options, .. } => Some(options),
+            StateItem::Jump(_) | StateItem::Hide(_) | StateItem::Show(_) => None,
             StateItem::Option { .. } => unreachable!(),
         };
 
-        // link remaining unlinked items with magic function
-        for item in std::iter::once(&this_state).chain(options.iter()) {
-            let next @ None = &mut links[*item] else {
+        if links[this_state].is_some()
+            && (maybe_options.is_none()
+                || maybe_options.is_some_and(|opts| opts.iter().all(|o| links[*o].is_some())))
+        {
+            continue;
+        }
+
+        let found_next_item =
+            find_next_state_long_long_way(&states[i..], parents, sibling_idx, items_depth)
+                .map(|item_idx| item_idx + link_offset);
+
+        links[this_state] = found_next_item;
+
+        let Some(options) = maybe_options else {
+            continue;
+        };
+
+        for opt in options {
+            let next @ None = &mut links[*opt] else {
                 continue;
             };
-
-            if !searched {
-                searched = true;
-                found_next_item =
-                    find_next_state_long_long_way(&states[i..], &parents, &sibling_idx, item_depth)
-                        .map(|item_idx| item_idx + link_offset);
-            }
 
             *next = found_next_item;
         }
@@ -765,52 +839,50 @@ fn get_depth_from_indent(indentation: Indentation, single_indent: Indentation, l
     got_amount / single_amount
 }
 
-fn update_family(
-    new_state: usize,
-    maybe_last_state: Option<usize>,
-    states_parents: &mut HashMap<usize, usize>,
-    sibling_idx: &mut HashMap<usize, u32>,
+fn welcome_to_the_family(
+    new_item: usize,
+    maybe_prev_item: Option<usize>,
+    parents: &mut Vec<Option<usize>>,
+    sibling_idx: &mut Vec<u32>, // no need to store sibling idx for options
     item_depth: &[u32],
 ) {
-    let mut parent = None;
-    let mut sibling_counter = 0;
+    let mut sib_idx = 0;
+    let mut parent = None::<usize>;
 
-    if let Some(last_state) = maybe_last_state {
+    if let Some(prev_item) = maybe_prev_item {
         // if last state is a sibling
-        if item_depth[last_state] == item_depth[new_state] {
-            sibling_counter = sibling_idx[&last_state] + 1;
-            parent = states_parents.get(&last_state).copied();
+        if item_depth[prev_item] == item_depth[new_item] {
+            sib_idx = sibling_idx[prev_item] + 1;
+            parent = parents[prev_item];
         // if last state is a parent of this new item
-        } else if item_depth[last_state] < item_depth[new_state] {
-            parent = Some(last_state);
-        // if last item is a child of some parent item
-        } else if item_depth[last_state] > item_depth[new_state] {
-            let mut last_state_parent = last_state;
+        } else if item_depth[prev_item] < item_depth[new_item] {
+            parent = Some(prev_item);
+        // if last item is a child of some other parent
+        } else if item_depth[prev_item] > item_depth[new_item] {
+            let mut last_state_parent = prev_item;
 
-            // go back along the states_parents tree until we found one with the same depth
-            while item_depth[last_state_parent] != item_depth[new_state] {
-                let Some(upper_parent) = states_parents.get(&last_state_parent) else {
+            // go back along the parents tree until we found one with the same depth
+            while item_depth[last_state_parent] != item_depth[new_item] {
+                let Some(upper_parent) = parents[last_state_parent] else {
                     break;
                 };
 
-                last_state_parent = *upper_parent;
+                last_state_parent = upper_parent;
             }
 
-            sibling_counter = sibling_idx[&last_state_parent] + 1;
-            parent = states_parents.get(&last_state_parent).copied();
+            sib_idx = sibling_idx[last_state_parent] + 1;
+            parent = parents[last_state_parent];
         }
     }
 
-    sibling_idx.insert(new_state, sibling_counter);
-    if let Some(p) = parent {
-        states_parents.insert(new_state, p);
-    }
+    sibling_idx.insert(new_item, sib_idx);
+    parents.push(parent);
 }
 
 fn find_next_state_long_long_way(
     states: &[usize],
-    states_parents: &HashMap<usize, usize>,
-    sibling_idx: &HashMap<usize, u32>,
+    parents: &[Option<usize>],
+    sibling_idx: &[u32],
     item_depth: &[u32],
 ) -> Option<usize> {
     let mut current = states.first().copied()?;
@@ -819,18 +891,18 @@ fn find_next_state_long_long_way(
         'searching: for state in states.iter().skip(1) {
             if item_depth[current] != item_depth[*state] {
                 continue 'searching;
-            } else if sibling_idx[&current] >= sibling_idx[state] {
+            } else if sibling_idx[current] >= sibling_idx[*state] {
                 break 'searching;
-            } else if sibling_idx[&current] + 1 == sibling_idx[state] {
+            } else if sibling_idx[current] + 1 == sibling_idx[*state] {
                 return Some(*state);
             }
         }
 
-        let Some(parent) = states_parents.get(&current) else {
+        let Some(parent) = parents[current] else {
             break;
         };
 
-        current = *parent
+        current = parent
     }
 
     None

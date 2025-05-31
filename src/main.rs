@@ -4,6 +4,21 @@ mod utils;
 use lexer::StateItem;
 use std::path::Path;
 
+// TODO: need to do something with cases like this:
+//
+//      @as start
+//      - start
+//          @hide
+//
+//      @jump start
+//      # which leads to inf loop of jumping to itself
+//      # same as
+//      @as aboba
+//      @jump aboba       # which is funny
+//
+//
+// i mean it is a logical error, not a problem of the language, but maybe a debuger mode for murmur cli or some sort of to debug behaviour of the script
+
 // TODO: `@def <temlate name> [$args] <block>` macro and expanding it with
 //      @ <module>.<template> for expanding macro from other module
 //      @ .<tempate> for current module
@@ -34,7 +49,7 @@ use std::path::Path;
 //      and
 //      @ show [zero or miltiple space separated args]
 //
-//      that will manipulate the visibility of the item
+//      that will manipulate the vis of the item
 //      hide or show without arguments is going to operate on previous item, so something like this is possible:
 //          @as lbl
 //          - What?
@@ -60,6 +75,7 @@ use std::path::Path;
 
 #[derive(Debug)]
 pub struct Conversation {
+    vis: Vec<bool>,
     items: Vec<StateItem>,
     links: Vec<Option<usize>>,
 
@@ -86,44 +102,19 @@ impl Conversation {
         }
 
         let mut it = Self {
+            vis: vec![true; items.len()],
             current: 0,
             items,
             links,
         };
 
-        let mut unjumped = 0;
-        it.unjump_in_state(&mut unjumped);
-
-        it.current = unjumped;
+        it.get_to_response();
 
         Ok(it)
     }
 
     pub fn response(&self) -> Option<&str> {
-        self.response_in_state(self.current)
-    }
-
-    pub fn options(&self) -> impl Iterator<Item = &str> {
-        self.options_in_state(&self.current)
-    }
-
-    pub fn next_state(&mut self) -> Option<()> {
-        self.current = self.next_state_after(self.current)?;
-        Some(())
-    }
-
-    pub fn next_state_from_option(&mut self, option_idx: usize) -> Option<()> {
-        // TODO: either option idx is invalid or there is no next_state..
-        self.current = self
-            .options_indices_in_state(&self.current)
-            .get(option_idx)
-            .and_then(|opt| self.next_state_after(*opt))?;
-
-        Some(())
-    }
-
-    fn response_in_state(&self, state: usize) -> Option<&str> {
-        if let StateItem::Response { phrase, .. } = &self.items[state]
+        if let StateItem::Response { phrase, .. } = &self.items[self.current]
             && !phrase.is_empty()
         {
             Some(phrase.as_str())
@@ -132,18 +123,9 @@ impl Conversation {
         }
     }
 
-    fn options_indices_in_state<'s>(&'s self, state: &'s usize) -> &'s [usize] {
-        match &self.items[*state] {
-            StateItem::OptionsBlock(options) => options.as_slice(),
-            StateItem::Response { options, .. } => options.as_slice(),
-            StateItem::Option { .. } => std::slice::from_ref(state),
-            StateItem::Jump => unreachable!(),
-        }
-    }
-
-    fn options_in_state<'s>(&'s self, state: &'s usize) -> impl Iterator<Item = &'s str> {
-        self.options_indices_in_state(state).iter().map(|opt| {
-            let StateItem::Option { phrase, .. } = &self.items[*opt] else {
+    pub fn options(&self) -> impl Iterator<Item = &str> {
+        self.options_indices().map(|opt| {
+            let StateItem::Option { phrase, .. } = &self.items[opt] else {
                 unreachable!();
             };
 
@@ -151,28 +133,65 @@ impl Conversation {
         })
     }
 
-    fn next_state_after(&self, mut state: usize) -> Option<usize> {
-        state = self.links[state]?;
-        self.unjump_in_state(&mut state);
-        Some(state)
+    pub fn next_state(&mut self) -> Option<()> {
+        self.current = self.links[self.current]?;
+        self.get_to_response()
     }
 
-    fn unjump_in_state(&self, state: &mut usize) {
-        while let StateItem::Jump = &self.items[*state] {
-            // print!("# unjumping from {state}");
-            *state = self.links[*state].unwrap(); // there is always a labeled item on which jump is pointing
-            // println!(" to {state}");
+    pub fn next_state_from_option(&mut self, option_idx: usize) -> Option<()> {
+        let next = self
+            .options_indices()
+            .nth(option_idx)
+            .expect("valid index of an option"); // TODO: error
+
+        self.current = next;
+        self.next_state()?;
+
+        Some(())
+    }
+
+    pub fn get_to_response(&mut self) -> Option<()> {
+        loop {
+            match &self.items[self.current] {
+                _ if !self.vis[self.current] => self.current = self.links[self.current]?,
+                StateItem::Response { .. } => return Some(()),
+                StateItem::Show(items) => {
+                    for item in items {
+                        self.vis[*item] = true;
+                    }
+                    self.current = self.links[self.current]?;
+                }
+                StateItem::Hide(items) => {
+                    for item in items {
+                        self.vis[*item] = false;
+                    }
+                    self.current = self.links[self.current]?;
+                }
+                StateItem::Jump(target) =>  self.current = *target,
+                StateItem::Option { .. } => unreachable!(),
+            }
+        }
+    }
+
+    fn options_indices(&self) -> impl Iterator<Item = usize> {
+        match &self.items[self.current] {
+            StateItem::Response { options, .. } => {
+                options.iter().filter(|opt| self.vis[**opt]).copied()
+            }
+            _ => unreachable!(),
         }
     }
 }
 
 fn run(mut conv: Conversation) -> std::io::Result<()> {
     use std::io::Write;
+    // println!("{:#?}", conv.items);
 
     let out = &mut std::io::stdout();
     let mut input = String::new();
 
     loop {
+        println!("{:#?}", conv.vis);
         let state = conv.current;
 
         write!(out, "- ")?;
@@ -186,26 +205,23 @@ fn run(mut conv: Conversation) -> std::io::Result<()> {
             None => writeln!(out, "End]")?,
         }
 
-        let opt_indices = conv.options_indices_in_state(&state);
+        let opt_indices = conv.options_indices();
 
         for (i, (phrase, opt)) in conv.options().zip(opt_indices).enumerate() {
             write!(out, "({i}) > {phrase:?} [{opt} -> ")?;
-            match &conv.links[*opt] {
+            match &conv.links[opt] {
                 Some(next) => writeln!(out, "{next}]")?,
                 None => writeln!(out, "End]")?,
             }
         }
 
         out.flush()?;
-
         let next = loop {
             input.clear();
             std::io::stdin().read_line(&mut input)?;
             utils::trim(&mut input);
 
-            if let Ok(opt_idx) = input.parse::<usize>()
-                && opt_idx < opt_indices.len()
-            {
+            if let Ok(opt_idx) = input.parse::<usize>() {
                 break conv.next_state_from_option(opt_idx);
             } else if input.is_empty() {
                 break conv.next_state();
@@ -222,51 +238,56 @@ fn run(mut conv: Conversation) -> std::io::Result<()> {
     Ok(())
 }
 
-// TODO: depth
 const TEST_CONVO: &str = "
 # nice
 
 @import test
 
 @as suka
-    - 23
+    - 23 -> jump to 0, which is jump to 1
     @jump start # 24 -> 0
 
 @jump suka # 0 -> 23
 
 @as start
-- 0 -> 15
-> 1 -> 2
-    - 2 -> 15
-    > 3 -> 4
-        - 4 -> 15
-    > 5 -> 6
-        - 6 -> 9
-        > 7 -> 9
-        > 8 -> 9
+- 1 -> 16
+> 2 -> 3
+    @hide start tutu
 
-        - 9 -> 15
-        > 10 -> 15
-> 11 -> 12
-    - 12 -> 13
-    - 13 -> 15
-    > 14 -> 15
+    - 3 -> 16
+    > 4 -> 5
+        - 5 -> 16
+    > 6 -> 7
+        - 7 -> 10
+        > 8 -> 10
+        > 9 -> 10
 
-- 15 -> 16
+        - 10 -> 16
+        > 11 -> 16
+> 12 -> 13
+    - 13 -> 14
+    - 14 -> 16
+    > 15 -> 16
+
+@as tutu
+@jump start
 
 - 16 -> 17
-    - 17 -> 19
-    > 18 -> 19
+@show tutu start
+@jump tutu
 
-- 19 -> 20 which is a jump to a test.mur file -> 21
-@jump test.Test # 20 -> 21 which is in test.mur file
+- 17 -> 18
+    - 18 -> 20
+    > 19 -> 20
+
+- 20 -> 21 which is a jump to a test.mur file -> 22
+@jump test.Test # 23 -> 24 which is in test.mur file
 ";
 
-
 fn main() {
-    // let Ok(mut convo) = Conversation::from_source(TEST_CONVO, "main") else {return;};
-    let Ok(mut convo) = Conversation::from_source(TEST_CONVO, "main") else {
+    let Ok(convo) = Conversation::from_source(TEST_CONVO, "main") else {
         return;
     };
+
     run(convo).unwrap();
 }
