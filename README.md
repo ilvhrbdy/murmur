@@ -88,19 +88,21 @@ Here you can get a sense of the logic of state transitioning:
 Each function starts with `@` and operates on next response or option:
 
 #### `@<func> [args] ...`
-Calls a custom function, Where `func` is not one of the built-ins. Your custom functions will be defined via `HashMap<String, fn(&mut YourCustomState, &[String]) -> _` that you pass to the parser.
+Calls a custom function, Where `func` is not one of the built-ins. Your custom functions will be defined via `HashMap<&str, fn(&mut YourCustomState, &[String]) -> _` that you pass to the parser.
 ```rust
-fn tell_a_joke_to(my_state: &mut MyState, args: &[String]) {
+fn tell_a_joke(my_state: &mut MyState, args: &[String]) -> ReturnValue {
     println!("I love you! Why can't you see that, {name}?!", name = args[0]);
     my_state.psychological -= 1;
+
+    ReturnValue::None // or ().into(), doesn't matter in this case, because value will be dropped anyway
 }
 
-funcs_map.insert("tell_a_joke_to".into(), tell_a_joke as _);
+funcs_map.insert("tell_a_joke_to", tell_a_joke as _);
 // pass the map to the Conversation::load
 ```
 and then in *murmur* file:
 ```
-@ tell_a_joke_to bitch
+@ tell_a_joke_to whore
 ```
 This function will be executed each time it appears, but if you want a function that is executed only once, use `@ !<func>` syntax:
 ```
@@ -178,15 +180,16 @@ Will disable/enable the specified items, causing them to be skipped. If no label
 @show where how_much
 @jump useful_convo
 ```
+#### String interpolation using `@{<func> [args] ...}`
+Used in options and responses. This works the same way as calling inline functions. For example, `@{ func }` is evaluated each time it occurs, whereas `@{ !func }` constructs a static string:
+```
+- {!player_name}, you are @{random_insult}!
+```
 
 - TODO: `@if <func>`, `@elif <func>` and `@else`, where `func` is your `fn(&mut YourCustomState) -> bool`.
 
 - TODO: `@return` will undo the previous `@jump`, continuing from the next item after the jump.
 
-- TODO: `@{<func>}` enables string interpolation in phrases (responses and options), where `func` is your `fn(&mut YourCustomState) -> AnyDisplayableValue`:
-```
-- You are @{random_insult}!
-```
 - TODO: `@def <template name> [$args] <content>` defines a macro that generates *murmur* chunks. Chunk is just a string, that behaves differently, depending on the context:
 ```
 @def jump_if $condition $label
@@ -202,7 +205,7 @@ within a string interpolation, chunk is expanded as a plain string:
 ```
 @ def smell psina
 
-- Man, you smell like {.smell}!
+- Man, you smell like @{.smell}!
 
 @ .smell # parsing error if `psina` is not defined
 ```

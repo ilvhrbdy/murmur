@@ -1,21 +1,11 @@
 mod lexer;
 mod utils;
 
-use lexer::{Func, StateItem};
+use lexer::{Func, Item, Phrase, ReturnValue};
 use std::collections::HashMap;
 use std::path::Path;
 
 // TODO: test funcs + comptime funcs
-
-
-
-
-
-
-
-
-
-
 
 // TODO: need to do something with cases like this:
 //
@@ -31,6 +21,13 @@ use std::path::Path;
 //
 //
 // i mean it is a logical error, not a problem of the language, but maybe a debuger mode for murmur cli or some sort of to debug behaviour of the script
+// we could warn for some weird behavior like this:
+//
+//      @as aboba
+//      @jump aboba
+//
+//      which is a valid murmur syntax, but just an infinite loop
+//      maybe i need to be strict with this kind of shit?
 
 // TODO: `@def <temlate name> [$args] <block>` macro and expanding it with
 //      @ <module>.<template> for expanding macro from other module
@@ -44,34 +41,9 @@ use std::path::Path;
 // @def block $opt
 //      - aboba
 //      > $opt
-// TODO:
-// enum Phrase {
-//     Static(String),
-//     Dynamic {
-//         buffer: String,
-//         parts: Vec<PhraseParts>
-//     }
-// }
-
-// enum PhraseParts {
-//     Static(String),
-//     FromFunction(usize),
-// }
-// TODO: compile time "once" function execution with `@ !func` or `@{ !func }`
 // TODO: @if @elif @else
-// TODO: function mapping and calling via `@ func` or @{ func } or comp time version with "!"
-// TODO: @{} - text expansion function (either text of labeled item or function)
-//      in this case we cannot have labeled item and function with the same name
-// TODO: the `main` module is always available even without @import and it kind of counter-intuitive. should i fix that?
 // TODO: write tests, please?
 // TODO: normal error messages
-// TODO: we could warn for some weird behavior like this:
-//
-//      @as aboba
-//      @jump aboba
-//
-//      which is a valid murmur syntax, but just an infinite loop
-//      maybe i need to be strict with this kind of shit?
 
 #[derive(Debug)]
 pub struct Conversation<State> {
@@ -79,7 +51,7 @@ pub struct Conversation<State> {
     funcs: Vec<Func<State>>,
 
     vis: Vec<bool>,
-    items: Vec<StateItem>,
+    items: Vec<Item>,
     links: Vec<Option<usize>>,
 
     current: usize,
@@ -88,7 +60,7 @@ pub struct Conversation<State> {
 impl<State> Conversation<State> {
     pub fn load(
         path: impl AsRef<Path>,
-        funcs_map: HashMap<String, Func<State>>,
+        funcs_map: HashMap<&'static str, Func<State>>,
         state: State,
     ) -> Result<Self, ()> {
         let path = path.as_ref();
@@ -102,7 +74,7 @@ impl<State> Conversation<State> {
     pub fn from_source(
         src: impl AsRef<str>,
         module_name: &str,
-        funcs_map: HashMap<String, Func<State>>,
+        funcs_map: HashMap<&'static str, Func<State>>,
         mut state: State,
     ) -> Result<Self, ()> {
         let tokens = lexer::tokenize(src.as_ref());
@@ -129,7 +101,7 @@ impl<State> Conversation<State> {
     }
 
     pub fn response(&self) -> Option<&str> {
-        if let StateItem::Response { phrase, .. } = &self.items[self.current]
+        if let Item::Response { phrase, .. } = &self.items[self.current]
             && !phrase.is_empty()
         {
             Some(phrase.as_str())
@@ -140,11 +112,13 @@ impl<State> Conversation<State> {
 
     pub fn options(&self) -> impl Iterator<Item = &str> {
         self.options_indices().map(|opt| {
-            let StateItem::Option { phrase, .. } = &self.items[opt] else {
+            let Item::Option { phrase, .. } = &self.items[opt] else {
                 unreachable!();
             };
 
-            phrase.as_str()
+            let (Phrase::Static(buffer) | Phrase::Dynamic { buffer, .. }) = &phrase;
+
+            buffer.as_str()
         })
     }
 
@@ -157,7 +131,7 @@ impl<State> Conversation<State> {
         let next = self
             .options_indices()
             .nth(option_idx)
-            .expect("valid index of an option"); // TODO: error
+            .expect("valid index of an option"); // TODO: error?
 
         self.current = next;
         self.next_state()?;
@@ -165,50 +139,83 @@ impl<State> Conversation<State> {
         Some(())
     }
 
-    pub fn get_to_response(&mut self) -> Option<()> {
+    fn options_indices(&self) -> impl Iterator<Item = usize> {
+        match &self.items[self.current] {
+            Item::Response { options, .. } => options,
+            _ => unreachable!(),
+        }
+        .iter()
+        .filter(|opt| self.vis[**opt])
+        .copied()
+    }
+
+    fn get_to_response(&mut self) -> Option<()> {
         loop {
             match &self.items[self.current] {
                 _ if !self.vis[self.current] => self.current = self.links[self.current]?,
-                StateItem::Response { .. } => {
+                Item::Response { .. } => {
+                    self.update_phrases_in_state();
                     // println!("found next response");
                     return Some(());
                 }
-                StateItem::Show(items) => {
+                Item::Show(items) => {
                     for item in items {
                         //     println!("showing item {item}");
                         self.vis[*item] = true;
                     }
                     self.current = self.links[self.current]?;
                 }
-                StateItem::Hide(items) => {
+                Item::Hide(items) => {
                     for item in items {
                         //     println!("hiding item {item}");
                         self.vis[*item] = false;
                     }
                     self.current = self.links[self.current]?;
                 }
-                StateItem::Jump(target) => {
+                Item::Jump(target) => {
                     // println!("jumping to {target}");
                     self.current = *target;
                 }
-                StateItem::FunctionCall { func, args } => {
+                Item::FunctionCall { func, args } => {
                     (self.funcs[*func])(&mut self.state, args);
                     self.current = self.links[self.current]?;
                 }
-                StateItem::Option { .. } => unreachable!(),
+                Item::Option { .. } => unreachable!(),
             }
         }
     }
 
-    fn options_indices(&self) -> impl Iterator<Item = usize> {
-        match &self.items[self.current] {
-            StateItem::Response { options, .. } => options,
-            StateItem::Option { .. } => std::slice::from_ref(&self.current),
-            _ => unreachable!(),
+    fn update_phrases_in_state(&mut self) {
+        let Item::Response { phrase, .. } = &mut self.items[self.current] else {
+            unreachable!();
+        };
+
+        phrase.update(&self.funcs, &mut self.state);
+
+        let Some((left, right)) = self.items.split_at_mut_checked(self.current + 1) else {
+            // means there is no options
+            return;
+        };
+
+        let Some(Item::Response { options, .. }) = left.last_mut() else {
+            unreachable!();
+        };
+
+        let offset = self.current + 1;
+
+        for &option in options.iter() {
+            let opt = option - offset;
+
+            if !self.vis[opt] {
+                continue;
+            }
+
+            let Item::Option { phrase } = &mut right[opt] else {
+                unreachable!();
+            };
+
+            phrase.update(&self.funcs, &mut self.state);
         }
-        .iter()
-        .filter(|opt| self.vis[**opt])
-        .copied()
     }
 }
 
@@ -279,14 +286,11 @@ const TEST_CONVO: &str = "
     - 23 -> 24, which is a jump to `start`
     @jump test.Test # 24 -> 0
 
-@as call
-- suka
-@aboba
-@jump call # 0 -> 23
-
 @as start
-- 1 -> 16
-@as tutu
+- @{ aboba suka blyad idi nahuy } 1 -> 16
+@jump start
+
+- @{aboba suka} 1 -> 16
 > 2 -> 3
     - 3 -> 16
     > 4 -> 5
@@ -314,13 +318,16 @@ const TEST_CONVO: &str = "
 @jump test.Test # 23 -> 24 which is in test.mur file
 ";
 
-fn test(_: &mut (), args: &[String]) {
-    println!("your args: {args:?}");
+fn test(state: &mut usize, args: &[String]) -> ReturnValue {
+    let out = args[*state].clone();
+    *state += 1;
+    out.into()
 }
 
 fn main() {
-    let funcs = HashMap::<String, Func<()>>::from([("aboba".to_string(), test as _)]);
-    let Ok(convo) = Conversation::from_source(TEST_CONVO, "main", funcs, ()) else {
+    let Ok(convo) =
+        Conversation::from_source(TEST_CONVO, "main", [("aboba", test as _)].into(), 0usize)
+    else {
         return;
     };
 
