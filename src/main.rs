@@ -5,8 +5,6 @@ use lexer::{Func, Item, Phrase, ReturnValue};
 use std::collections::HashMap;
 use std::path::Path;
 
-// TODO: test funcs + comptime funcs
-
 // TODO: need to do something with cases like this:
 //
 //      @as start
@@ -42,6 +40,7 @@ use std::path::Path;
 //      - aboba
 //      > $opt
 // TODO: @if @elif @else
+//      idea: to validate that the function returns a bool we can execute it on a dummy (cloned) state and get the return value
 // TODO: write tests, please?
 // TODO: normal error messages
 
@@ -57,7 +56,7 @@ pub struct Conversation<State> {
     current: usize,
 }
 
-impl<State> Conversation<State> {
+impl<State: Clone> Conversation<State> {
     pub fn load(
         path: impl AsRef<Path>,
         funcs_map: HashMap<&'static str, Func<State>>,
@@ -66,7 +65,9 @@ impl<State> Conversation<State> {
         let path = path.as_ref();
         let file_name = path.file_name().unwrap().to_str().unwrap();
         let module_name = file_name.strip_suffix(".mur").unwrap_or(file_name);
-        let src = utils::read_mur_file(module_name)?;
+        let src = utils::read_mur_file(path).map_err(|e| {
+            eprintln!("failed to load file: {e}");
+        })?;
 
         Self::from_source(src, module_name, funcs_map, state)
     }
@@ -219,7 +220,7 @@ impl<State> Conversation<State> {
     }
 }
 
-fn run<State>(mut conv: Conversation<State>) -> std::io::Result<()> {
+fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
     use std::io::Write;
 
     // for i in 0..conv.items.len() {
@@ -277,20 +278,22 @@ fn run<State>(mut conv: Conversation<State>) -> std::io::Result<()> {
     Ok(())
 }
 
+// TODO: tell when import is unused
 const TEST_CONVO: &str = "
 # nice
 
 @import test
+@import test2
 
 @as suka
     - 23 -> 24, which is a jump to `start`
     @jump test.Test # 24 -> 0
 
 @as start
-- @{ aboba suka blyad idi nahuy } 1 -> 16
+- lasdkfj @{ aboba suka blyad idi nahuy } 1 -> 16 @{ aboba salupa }
 @jump start
 
-- @{aboba suka} 1 -> 16
+- @{kringe} 1 -> 16
 > 2 -> 3
     - 3 -> 16
     > 4 -> 5
@@ -318,15 +321,14 @@ const TEST_CONVO: &str = "
 @jump test.Test # 23 -> 24 which is in test.mur file
 ";
 
-fn test(state: &mut usize, args: &[String]) -> ReturnValue {
-    let out = args[*state].clone();
-    *state += 1;
-    out.into()
+fn test(_: &mut usize, _args: &[String]) -> ReturnValue {
+    ().into()
 }
 
 fn main() {
     let Ok(convo) =
         Conversation::from_source(TEST_CONVO, "main", [("aboba", test as _)].into(), 0usize)
+        // Conversation::load("test2.mur", [("aboba", test as _)].into(), 0usize)
     else {
         return;
     };

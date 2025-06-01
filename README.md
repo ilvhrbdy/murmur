@@ -7,7 +7,7 @@ Then you can just translate this struct into any format or other languages for a
 
 ## Future features
 Extensible and flexible: able to hold your generic external game state `Conversation<ExternalState>`, which will be mutated through a map of functions `fn(&mut ExternalState) -> OptionalOutput`.
-This means *murmur* doesn't care about what your game state looks like, and how you define your functions map, it will just call them, when called.
+This means *murmur* doesn't care about what your game state looks like, and how you define your functions map, it will just call them, when needed.
 
 Fast: conversation is parsed into static arrays (states, functions, labels, etc), which are linked together by indices. This means no runtime hashing or validation.
 
@@ -85,8 +85,6 @@ Here you can get a sense of the logic of state transitioning:
 ```
 
 ## Functions
-Each function starts with `@` and operates on next response or option:
-
 #### `@<func> [args] ...`
 Calls a custom function, Where `func` is not one of the built-ins. Your custom functions will be defined via `HashMap<&str, fn(&mut YourCustomState, &[String]) -> _` that you pass to the parser.
 ```rust

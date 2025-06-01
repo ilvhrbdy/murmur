@@ -260,12 +260,23 @@ struct ParserData {
     // Result
     items: Vec<Item>,
     links: Vec<Option<usize>>,
+    failed: bool,
 }
 
 pub enum ReturnValue {
     Bool(bool),
     String(String),
     None,
+}
+
+impl ReturnValue {
+    fn try_into_string(self) -> Option<String> {
+        match self {
+            ReturnValue::Bool(b) => Some(b.to_string()),
+            ReturnValue::String(s) => Some(s),
+            ReturnValue::None => None,
+        }
+    }
 }
 
 impl From<bool> for ReturnValue {
@@ -297,7 +308,7 @@ impl fmt::Display for ReturnValue {
         match self {
             ReturnValue::String(s) => write!(f, "{s}"),
             ReturnValue::Bool(b) => write!(f, "{b}"),
-            ReturnValue::None => write!(f, ""),
+            ReturnValue::None => Err(fmt::Error),
         }
     }
 }
@@ -305,14 +316,14 @@ impl fmt::Display for ReturnValue {
 pub(super) type Func<State> = fn(&mut State, args: &[String]) -> ReturnValue;
 
 #[allow(clippy::type_complexity)]
-pub(super) fn parse_tokens_into_items<State>(
+pub(super) fn parse_tokens_into_items<State: Clone>(
     main_module: &str,
     tokens: Vec<Token>,
     funcs_map_defs: HashMap<&'static str, Func<State>>,
     state: &mut State,
 ) -> Result<(Vec<Item>, Vec<Option<usize>>, Vec<Func<State>>), ()> {
     let mut parser = ParserData::default();
-    let mut failed = false;
+    let mut dummy_state = state.clone();
 
     let mut funcs = Vec::new();
     let mut funcs_map = HashMap::new();
@@ -329,18 +340,16 @@ pub(super) fn parse_tokens_into_items<State>(
         .push((main_module.into(), HashMap::new(), tokens));
 
     while !parser.load_queue.is_empty() {
-        let Ok(parsed_module_name) = parse_module(&mut parser, &funcs_map, &funcs, state) else {
-            failed = true;
-            continue;
-        };
+        let parsed_module_name =
+            parse_module(&mut parser, &funcs_map, &funcs, state, &mut dummy_state);
 
         if parsed_module_name == main_module && parser.entry_point.is_none() {
-            eprintln!("file doesn't contain any entry point state, conversation cannot be started");
+            eprintln!("'{main_module}' module doesn't contain any entry point state, conversation cannot be started");
             return Err(());
         }
     }
 
-    if failed {
+    if parser.failed {
         return Err(());
     }
 
@@ -398,11 +407,23 @@ fn parse_module<State>(
         entry_point,
         items,
         links,
+        failed,
     }: &mut ParserData,
     funcs_map: &HashMap<&'static str, usize>,
     funcs: &[Func<State>],
     state: &mut State,
-) -> Result<String, ()> {
+    dummy_state: &mut State,
+) -> String {
+    macro_rules! fail {
+        () => {{
+            *failed = true;
+        }};
+        ($($msg:tt)*) => {{
+            eprintln!($($msg)*);
+            fail!();
+        }}
+    }
+
     let link_offset = items.len();
     let Some((module_name, mut local_imports, tokens)) = load_queue.pop() else {
         unreachable!();
@@ -437,6 +458,7 @@ fn parse_module<State>(
     let mut module_items = Vec::<Item>::new();
     let mut label_to_assign = None::<(u32, String)>;
     let mut tokens = tokens.into_iter().peekable();
+    let mut prev_token_loc = Loc { line: 0, col: 0 };
 
     while let Some(token) = tokens.next() {
         let this_item = module_items.len() + link_offset;
@@ -453,11 +475,13 @@ fn parse_module<State>(
 
                     crate::utils::trim_end(text);
 
-                    let Ok(parsed_phrase) = parse_phrase(token.loc, text, funcs_map, funcs, state) else {
-                        return Err(());
-                    };
+                    // TODO: abort compilation on error
+                    if let Ok(parsed_phrase) = parse_phrase(prev_token_loc, text, funcs_map, funcs, state, dummy_state) {
+                        *phrase = parsed_phrase;
+                    } else {
+                        fail!();
+                    }
 
-                    *phrase = parsed_phrase;
                 }
 
                 if let Some((_, label)) = label_to_assign.take() {
@@ -504,11 +528,11 @@ fn parse_module<State>(
 
                 continue;
             } else if label_depth > token_depth {
-                eprintln!(
+                fail!(
                     "{:?} label must be either a parent of next item to define a block or to be at the same indentation depth as the next item",
                     token.loc
                 );
-                return Err(());
+                continue;
             }
         }
 
@@ -525,11 +549,11 @@ fn parse_module<State>(
                     p.push_str(&text);
                 }
                 _ => {
-                    eprintln!(
+                    fail!(
                         "{:?} {text:?} must belong to `-` response or `>` option",
                         token.loc
                     );
-                    return Err(());
+                    continue;
                 }
             },
             TokenKind::Response(phrase) => {
@@ -559,11 +583,11 @@ fn parse_module<State>(
                         (item_depth[i] == item_depth[this_item]).then_some(Ok(i))
                     })
                 else {
-                    eprintln!(
+                    fail!(
                         "{:?} couldn't find an option handler for {phrase:?} on this depth",
                         token.loc
                     );
-                    return Err(());
+                    continue;
                 };
 
                 sibling_idx.push(sibling_idx[opt_handler]);
@@ -576,62 +600,73 @@ fn parse_module<State>(
                     Item::Response { options, .. } => options.push(this_item),
                     Item::Option { .. } => unreachable!(),
                     _ => {
-                        eprintln!(
+                        fail!(
                             "{loc:?} options can only belong to responses, defined with `-`",
                             loc = token.loc,
                         );
-                        return Err(());
+                        continue;
                     }
                 };
             }
             TokenKind::Function { name, mut args } if name == "jump" => {
                 if args.len() > 1 {
-                    eprintln!(
+                    fail!(
                         "{loc:?} too many arguments for `jump` function, expected only one label",
                         loc = token.loc
                     );
-                    return Err(());
+                    continue;
                 }
 
                 if !func_signature_is_valid((&token.loc, &name), &args, &['.']) {
-                    return Err(());
+                    continue;
                 }
 
                 let Some((loc, label)) = args.pop() else {
-                    eprintln!(
+                    fail!(
                         "{loc:?} expected label for `jump` function",
                         loc = token.loc
                     );
-                    return Err(());
+                    continue;
                 };
 
                 let mut parts = label.split('.');
                 let jump_target = match (parts.next(), parts.next(), parts.next()) {
                     (.., Some(_)) => {
-                        eprintln!(
+                        fail!(
                             "{:?} invalid item access syntax, path may only contain one dot",
                             token.loc
                         );
-                        return Err(());
+                        continue;
                     }
                     (Some(import_name), Some(import_label), _) => {
                         if let Some(is_used) = local_imports.get_mut(import_name) {
                             *is_used = true;
                         } else {
-                            eprintln!(
+                            fail!(
                                 "{:?} `{import_name}` is not imported, so can't access `{import_label}` item",
                                 token.loc
                             );
-                            return Err(());
+                            continue;
                         }
 
                         let Some(is_loaded) = modules.get_mut(import_name) else {
-                            eprintln!("`{import_name}` is not imported, use @import");
-                            return Err(());
+                            fail!("`{import_name}` is not imported, use @import");
+                            continue;
                         };
 
                         if !*is_loaded {
-                            let src = crate::utils::read_mur_file(&format!("{import_name}.mur"))?;
+                            let src =
+                                match crate::utils::read_mur_file(format!("{import_name}.mur")) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        fail!(
+                                            "{:?} can't jump on imported label '{label}': {e}",
+                                            token.loc
+                                        );
+                                        continue;
+                                    }
+                                };
+
                             let import_tokens = tokenize(&src);
 
                             load_queue.push((
@@ -647,7 +682,6 @@ fn parse_module<State>(
                     (Some(label), None, _) => make_label(&module_name, label),
                     _ => unreachable!(),
                 };
-
                 assert!(
                     label_jumps
                         .insert(module_items.len() + link_offset, (loc, jump_target))
@@ -661,81 +695,79 @@ fn parse_module<State>(
                 if args.len() > 1 {
                     let (loc, _) = args[1];
 
-                    eprintln!(
-                        "{loc:?} too many arguments for `as` function, expected only one label",
-                    );
-                    return Err(());
+                    fail!("{loc:?} too many arguments for `as` function, expected only one label",);
+                    continue;
                 }
 
                 if !func_signature_is_valid((&token.loc, &name), &args, &[]) {
-                    return Err(());
+                    continue;
                 }
 
                 let Some((_, label)) = args.pop() else {
-                    eprintln!(
+                    fail!(
                         "{loc:?} expected label name for `as` function",
                         loc = token.loc
                     );
-                    return Err(());
+                    continue;
                 };
 
                 if label_to_assign.is_some() {
-                    eprintln!("function `as` cannot be labeled");
-                    return Err(());
+                    fail!("function `as` cannot be labeled");
+                    continue;
                 }
 
                 if tokens.peek().is_none() {
-                    eprintln!("standalone `as` function is not allowed");
-                    return Err(());
+                    fail!("standalone `as` function is not allowed");
+                    continue;
                 }
 
                 let name = make_label(&module_name, &label);
 
                 if labels_map.contains_key(&name) {
-                    eprintln!("duplicate label: {label}");
-                    return Err(());
+                    fail!("duplicate label: {label}");
+                    continue;
                 }
 
                 label_to_assign = Some((token_depth, name));
             }
             TokenKind::Function { name, mut args } if name == "import" => {
                 if args.len() > 1 {
-                    eprintln!(
+                    fail!(
                         "{loc:?} too many arguments for `import` function, expected only one module name",
                         loc = token.loc
                     );
-                    return Err(());
+                    continue;
                 }
 
                 if !func_signature_is_valid((&token.loc, &name), &args, &[]) {
-                    return Err(());
+                    continue;
                 }
 
                 if label_to_assign.is_some() {
-                    eprintln!(
+                    fail!(
                         "{loc:?} cannot assign label to the `import` function",
                         loc = token.loc
                     );
-                    return Err(());
+                    continue;
                 }
 
                 let Some((_, module)) = args.pop() else {
-                    eprintln!(
+                    fail!(
                         "{loc:?} expected module name for `import` function",
                         loc = token.loc
                     );
-                    return Err(());
+                    continue;
                 };
 
                 if module.trim().is_empty() {
-                    eprintln!("{:? }you didn't specify import name", token.loc);
-                    return Err(());
+                    fail!("{:? }you didn't specify import name", token.loc);
+                    continue;
                 } else if module == module_name {
-                    eprintln!("{:?} self import is weird", token.loc);
-                    return Err(());
+                    fail!("{:?} self import is weird", token.loc);
+                    continue;
                 } else if local_imports.contains_key(&module) {
-                    eprintln!("{:?} duplicate import `{module}`", token.loc);
-                    return Err(());
+                    fail!("{:?} duplicate import `{module}`", token.loc);
+                    continue;
                 } else {
                     local_imports.insert(module.clone(), false);
                     if let Entry::Vacant(e) = modules.entry(module.clone()) {
@@ -745,18 +777,18 @@ fn parse_module<State>(
             }
             TokenKind::Function { name, mut args } if name == "hide" || name == "show" => {
                 if !func_signature_is_valid((&token.loc, &name), &args, &['.']) {
-                    return Err(());
+                    continue;
                 }
 
                 register_state_item!(true);
 
                 let target_items = if args.is_empty() {
                     let Some(parent) = parents[this_item] else {
-                        eprintln!(
+                        fail!(
                             "{:?} this `hide` function without arguments affect it's parent, which is not present in our case :(",
                             token.loc
                         );
-                        return Err(());
+                        continue;
                     };
 
                     vec![parent]
@@ -782,23 +814,23 @@ fn parse_module<State>(
                     .map_or((false, name.as_str()), |rest| (true, rest));
 
                 let Some(func) = funcs_map.get(fn_name).copied() else {
-                    eprintln!("{:?} function `{fn_name}` is undefined", token.loc);
-                    return Err(());
+                    fail!("{:?} function `{fn_name}` is undefined", token.loc);
+                    continue;
                 };
 
                 if !func_signature_is_valid((&token.loc, fn_name), &args, &[]) {
-                    return Err(());
+                    continue;
                 }
 
                 let args = args.into_iter().map(|(_, a)| a).collect::<Vec<String>>();
 
                 if is_comptime_call {
                     if label_to_assign.is_some() {
-                        eprintln!(
+                        fail!(
                             "{:?} you cannot assign label for compile time function, it will not be present at runtime, bruh, obviously",
                             token.loc
                         );
-                        return Err(());
+                        continue;
                     }
 
                     (funcs[func])(state, &args);
@@ -808,6 +840,8 @@ fn parse_module<State>(
                 register_state_item!(true, Item::FunctionCall { func, args })
             }
         }
+
+        prev_token_loc = token.loc;
     }
 
     let module_links = link_state_items(
@@ -821,7 +855,7 @@ fn parse_module<State>(
     links.extend(module_links);
     items.extend(module_items);
 
-    Ok(module_name)
+    module_name
 }
 
 #[derive(Debug)]
@@ -864,7 +898,7 @@ impl Phrase {
                     let _ = match (funcs[*func])(state, args) {
                         ReturnValue::String(t) => write!(buffer, "{t}"),
                         ReturnValue::Bool(b) => write!(buffer, "{b}"),
-                        ReturnValue::None => continue, 
+                        ReturnValue::None => unreachable!(),
                     };
                 }
             }
@@ -884,18 +918,14 @@ fn parse_phrase<State>(
     funcs_map: &HashMap<&'static str, usize>,
     funcs: &[Func<State>],
     state: &mut State,
+    dummy_state: &mut State,
 ) -> Result<Phrase, ()> {
-    // println!("{phrase_loc:?} with input {input:?}");
     fn collect_func(stream: &mut impl Iterator<Item = (Loc, char)>) -> Option<Vec<(Loc, String)>> {
         let mut buf = String::new();
         let mut args = Vec::new();
         let mut arg_loc = None::<Loc>;
 
         for (loc, ch) in stream {
-            if arg_loc.is_none() {
-                arg_loc = Some(loc);
-            }
-
             if ch == '}' {
                 if !buf.is_empty() {
                     args.push((arg_loc.take().unwrap(), buf.clone()));
@@ -910,6 +940,10 @@ fn parse_phrase<State>(
                     buf.clear();
                 }
             } else {
+                if arg_loc.is_none() {
+                    arg_loc = Some(loc);
+                }
+
                 buf.push(ch);
             }
         }
@@ -917,6 +951,7 @@ fn parse_phrase<State>(
         None
     }
 
+    let mut failed = false;
     let mut parts = Vec::<PhraseParts>::new();
     let mut stream = input.chars().map(|ch| {
         let t = (phrase_loc, ch);
@@ -957,27 +992,31 @@ fn parse_phrase<State>(
         }
 
         let Some(func_args) = collect_func(&mut stream) else {
-            // TODO: display location
             eprintln!("{next_ch_loc:?} could not find '}}' delimiter");
             return Err(());
         };
 
-        let Some(((name_loc, name), args)) = func_args.split_first() else {
+        let Some(((func_loc, name), args)) = func_args.split_first() else {
             eprintln!("{next_ch_loc:?} expected function name within `@{{}}`");
-            return Err(());
+            failed = true;
+            continue;
         };
+
+        let func_loc = *func_loc;
 
         let (is_comptime_call, fn_name) = name
             .strip_prefix('!')
             .map_or((false, name.as_str()), |rest| (true, rest));
 
         let Some(func) = funcs_map.get(fn_name).copied() else {
-            eprintln!("{name_loc:?} function `{fn_name}` is undefined");
-            return Err(());
+            eprintln!("{func_loc:?} function `{fn_name}` is undefined");
+            failed = true;
+            continue;
         };
 
-        if !func_signature_is_valid((name_loc, fn_name), args, &[]) {
-            return Err(());
+        if !func_signature_is_valid((&func_loc, fn_name), args, &[]) {
+            failed = true;
+            continue;
         }
 
         let args = func_args
@@ -987,7 +1026,11 @@ fn parse_phrase<State>(
             .collect::<Vec<String>>();
 
         if is_comptime_call {
-            let output = (funcs[func])(state, &args).to_string();
+            let Some(output) = (funcs[func])(state, &args).try_into_string() else {
+                eprintln!("{func_loc:?} this function doesn't return a displayable value");
+                failed = true;
+                continue;
+            };
             if let Some(PhraseParts::Static(ph)) = parts.last_mut() {
                 ph.push_str(&output);
                 continue;
@@ -995,12 +1038,25 @@ fn parse_phrase<State>(
                 parts.push(PhraseParts::Static(output));
             }
         } else {
+            if (funcs[func])(dummy_state, &args)
+                .try_into_string()
+                .is_none()
+            {
+                eprintln!("{func_loc:?} function doesn't return a displayable value");
+                failed = true;
+                continue;
+            };
+
             parts.push(PhraseParts::FromFunction { func, args });
         }
     }
 
     if !buf.is_empty() {
         parts.push(PhraseParts::Static(buf));
+    }
+
+    if failed {
+        return Err(());
     }
 
     Ok(
