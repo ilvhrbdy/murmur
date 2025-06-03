@@ -56,17 +56,24 @@ pub struct Conversation<State> {
     current: usize,
 }
 
+// only to shut the linter, see no point in having error types anyway in my case
+pub enum Error {
+    ReadingInputFile,
+    ParsingSource,
+}
+
 impl<State: Clone> Conversation<State> {
     pub fn load(
         path: impl AsRef<Path>,
         funcs_map: HashMap<&'static str, Func<State>>,
         state: State,
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, Error> {
         let path = path.as_ref();
         let file_name = path.file_name().unwrap().to_str().unwrap();
         let module_name = file_name.strip_suffix(".mur").unwrap_or(file_name);
         let src = utils::read_mur_file(path).map_err(|e| {
             eprintln!("failed to load file: {e}");
+            Error::ReadingInputFile
         })?;
 
         Self::from_source(src, module_name, funcs_map, state)
@@ -77,15 +84,13 @@ impl<State: Clone> Conversation<State> {
         module_name: &str,
         funcs_map: HashMap<&'static str, Func<State>>,
         mut state: State,
-    ) -> Result<Self, ()> {
+    ) -> Result<Self, Error> {
         let tokens = lexer::tokenize(src.as_ref());
-        let (items, links, funcs) =
-            lexer::parse_tokens_into_items(module_name, tokens, funcs_map, &mut state)?;
-
-        if items.is_empty() {
-            eprintln!("you must define at least one state");
-            return Err(());
-        }
+        let Ok((items, links, funcs)) =
+            lexer::parse_tokens_into_items(module_name, tokens, funcs_map, &mut state)
+        else {
+            return Err(Error::ParsingSource);
+        };
 
         let mut it = Self {
             state,
@@ -283,7 +288,6 @@ const TEST_CONVO: &str = "
 # nice
 
 @import test
-@import test2
 
 @as suka
     - 23 -> 24, which is a jump to `start`
@@ -291,9 +295,9 @@ const TEST_CONVO: &str = "
 
 @as start
 - lasdkfj @{ aboba suka blyad idi nahuy } 1 -> 16 @{ aboba salupa }
-@jump start
+# @jump start
 
-- @{kringe} 1 -> 16
+- 1 -> 16
 > 2 -> 3
     - 3 -> 16
     > 4 -> 5
@@ -322,13 +326,13 @@ const TEST_CONVO: &str = "
 ";
 
 fn test(_: &mut usize, _args: &[String]) -> ReturnValue {
-    ().into()
+    "hello".into()
 }
 
 fn main() {
     let Ok(convo) =
         Conversation::from_source(TEST_CONVO, "main", [("aboba", test as _)].into(), 0usize)
-        // Conversation::load("test2.mur", [("aboba", test as _)].into(), 0usize)
+    // Conversation::load("test2.mur", [("aboba", test as _)].into(), 0usize)
     else {
         return;
     };

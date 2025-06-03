@@ -1,6 +1,7 @@
 pub(crate) fn read_mur_file(path: impl AsRef<std::path::Path>) -> Result<String, String> {
     let path = path.as_ref();
-    let src = std::fs::read_to_string(path).map_err(|read_err| format!("'{p}' {read_err}", p = path.display()))?;
+    let src = std::fs::read_to_string(path)
+        .map_err(|read_err| format!("'{p}' {read_err}", p = path.display()))?;
 
     Ok(src)
 }

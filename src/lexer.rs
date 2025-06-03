@@ -55,7 +55,7 @@ impl Default for Indentation {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 struct Loc {
     line: u32,
     col: u32,
@@ -246,23 +246,6 @@ pub(super) enum Item {
     FunctionCall { func: usize, args: Vec<String> },
 }
 
-#[derive(Default)]
-struct ParserData {
-    single_indentation: Indentation,
-    labels_map: HashMap<String, usize>,
-    label_jumps: HashMap<usize, (Loc, String)>, // to store all jumps, before all labels are defined
-    label_vis_changes: HashMap<usize, Vec<(Loc, String)>>, // to store args for `hide` or `show` funcs, before all labels are defined
-
-    entry_point: Option<usize>,
-    modules: HashMap<String, bool>, // keep track of what is already imported
-    load_queue: Vec<(String, HashMap<String, bool>, Vec<Token>)>, // module name, local imports (if parsing an `as` block), tokens
-
-    // Result
-    items: Vec<Item>,
-    links: Vec<Option<usize>>,
-    failed: bool,
-}
-
 pub enum ReturnValue {
     Bool(bool),
     String(String),
@@ -315,6 +298,24 @@ impl fmt::Display for ReturnValue {
 
 pub(super) type Func<State> = fn(&mut State, args: &[String]) -> ReturnValue;
 
+#[derive(Default)]
+struct ParserData {
+    single_indentation: Indentation,
+    labels_map: HashMap<String, usize>,
+    label_jumps: HashMap<usize, (Loc, String)>, // to store all jumps, before all labels are defined
+    label_vis_changes: HashMap<usize, Vec<(Loc, String)>>, // to store args for `hide` or `show` funcs, before all labels are defined
+
+    entry_point: Option<usize>,
+    modules: HashMap<String, (bool, Loc)>, // keep track of what is already imported
+    local_imports: HashMap<String, HashMap<String, (bool, Loc)>>,
+    load_queue: Vec<(String, Vec<Token>)>, // module name, tokens
+
+    // Result
+    items: Vec<Item>,
+    links: Vec<Option<usize>>,
+    failed: bool,
+}
+
 #[allow(clippy::type_complexity)]
 pub(super) fn parse_tokens_into_items<State: Clone>(
     main_module: &str,
@@ -334,18 +335,28 @@ pub(super) fn parse_tokens_into_items<State: Clone>(
     }
 
     // TODO: avoid second allocation for the name
-    parser.modules.insert(main_module.into(), true);
     parser
-        .load_queue
-        .push((main_module.into(), HashMap::new(), tokens));
+        .modules
+        .insert(main_module.into(), (true, Loc::default()));
+    parser.load_queue.push((main_module.into(), tokens));
 
     while !parser.load_queue.is_empty() {
-        let parsed_module_name =
-            parse_module(&mut parser, &funcs_map, &funcs, state, &mut dummy_state);
+        let parsed_module = parse_module(&mut parser, &funcs_map, &funcs, state, &mut dummy_state);
 
-        if parsed_module_name == main_module && parser.entry_point.is_none() {
-            eprintln!("'{main_module}' module doesn't contain any entry point state, conversation cannot be started");
+        if parsed_module == main_module && parser.entry_point.is_none() {
+            eprintln!(
+                "'{main_module}' module doesn't contain any entry point state, conversation cannot be started"
+            );
             return Err(());
+        }
+    }
+
+    for (module, imports) in parser.local_imports {
+        for (imp, (is_used, loc)) in imports {
+            if !is_used {
+                eprintln!("{loc:?} in `{module}` import `{imp}` was never referensed anywhere");
+                parser.failed = true;
+            }
         }
     }
 
@@ -387,12 +398,6 @@ pub(super) fn parse_tokens_into_items<State: Clone>(
         }
     }
 
-    for (module, is_used) in parser.modules {
-        if !is_used {
-            eprintln!("[Warn] `{module}` was not loaded, because it was never referenced anywhere");
-        }
-    }
-
     Ok((parser.items, parser.links, funcs))
 }
 
@@ -400,6 +405,7 @@ fn parse_module<State>(
     ParserData {
         load_queue,
         modules,
+        local_imports,
         single_indentation,
         labels_map,
         label_jumps,
@@ -425,7 +431,7 @@ fn parse_module<State>(
     }
 
     let link_offset = items.len();
-    let Some((module_name, mut local_imports, tokens)) = load_queue.pop() else {
+    let Some((module_name, tokens)) = load_queue.pop() else {
         unreachable!();
     };
 
@@ -524,7 +530,7 @@ fn parse_module<State>(
 
                 // TODO: i thought that i could just push locala imports but at this point not all of the imports availabel
                 //          because @import may be located later in the file (after the block), which is not a big deal?
-                load_queue.push((module_name.clone(), local_imports.clone(), block));
+                load_queue.push((module_name.clone(), block));
 
                 continue;
             } else if label_depth > token_depth {
@@ -621,11 +627,8 @@ fn parse_module<State>(
                     continue;
                 }
 
-                let Some((loc, label)) = args.pop() else {
-                    fail!(
-                        "{loc:?} expected label for `jump` function",
-                        loc = token.loc
-                    );
+                let Some((label_loc, label)) = args.pop() else {
+                    fail!("{:?} expected label for `jump` function", token.loc);
                     continue;
                 };
 
@@ -633,26 +636,26 @@ fn parse_module<State>(
                 let jump_target = match (parts.next(), parts.next(), parts.next()) {
                     (.., Some(_)) => {
                         fail!(
-                            "{:?} invalid item access syntax, path may only contain one dot",
-                            token.loc
+                            "{label_loc:?} invalid item access syntax, path may only contain one dot",
                         );
                         continue;
                     }
                     (Some(import_name), Some(import_label), _) => {
-                        if let Some(is_used) = local_imports.get_mut(import_name) {
+                        if let Some((is_used, _)) = local_imports
+                            .get_mut(&module_name)
+                            .and_then(|imports| imports.get_mut(import_name))
+                        {
                             *is_used = true;
                         } else {
                             fail!(
-                                "{:?} `{import_name}` is not imported, so can't access `{import_label}` item",
-                                token.loc
+                                "{label_loc:?} in `{module_name}`: `{import_name}` is not imported, so can't access `{import_label}` item",
                             );
                             continue;
                         }
 
-                        let Some(is_loaded) = modules.get_mut(import_name) else {
-                            fail!("`{import_name}` is not imported, use @import");
-                            continue;
-                        };
+                        let (is_loaded, _) = modules
+                            .get_mut(import_name)
+                            .expect("import is registered in both `modules` and `local_imports`");
 
                         if !*is_loaded {
                             let src =
@@ -669,11 +672,7 @@ fn parse_module<State>(
 
                             let import_tokens = tokenize(&src);
 
-                            load_queue.push((
-                                import_name.to_string(),
-                                HashMap::new(),
-                                import_tokens,
-                            ));
+                            load_queue.push((import_name.to_string(), import_tokens));
                             *is_loaded = true;
                         }
 
@@ -684,7 +683,7 @@ fn parse_module<State>(
                 };
                 assert!(
                     label_jumps
-                        .insert(module_items.len() + link_offset, (loc, jump_target))
+                        .insert(module_items.len() + link_offset, (label_loc, jump_target))
                         .is_none(),
                     "it seems like jump got overwritten, is it even possilbe?"
                 );
@@ -751,7 +750,7 @@ fn parse_module<State>(
                     continue;
                 }
 
-                let Some((_, module)) = args.pop() else {
+                let Some((module_name_loc, module)) = args.pop() else {
                     fail!(
                         "{loc:?} expected module name for `import` function",
                         loc = token.loc
@@ -759,19 +758,26 @@ fn parse_module<State>(
                     continue;
                 };
 
-                if module.trim().is_empty() {
-                    fail!("{:? }you didn't specify import name", token.loc);
-                    continue;
-                } else if module == module_name {
-                    fail!("{:?} self import is weird", token.loc);
-                    continue;
-                } else if local_imports.contains_key(&module) {
-                    fail!("{:?} duplicate import `{module}`", token.loc);
+                if module == module_name {
+                    fail!("{:?} self import is weird", module_name_loc);
                     continue;
                 } else {
-                    local_imports.insert(module.clone(), false);
                     if let Entry::Vacant(e) = modules.entry(module.clone()) {
-                        e.insert(false);
+                        e.insert((false, module_name_loc));
+                    }
+
+                    if let Some(imps) = local_imports.get_mut(&module_name) {
+                        if let Some((m, prev_loc)) = imps.insert(module, (false, module_name_loc)) {
+                            fail!(
+                                "{:?} duplicate import `{m}`, previous import at {prev_loc:?}",
+                                module_name_loc
+                            );
+                        }
+                    } else {
+                        local_imports.insert(
+                            module_name.clone(),
+                            [(module, (false, module_name_loc))].into(),
+                        );
                     }
                 }
             }
@@ -1179,6 +1185,7 @@ fn get_depth_from_indent(indentation: Indentation, single_indent: Indentation, l
         if let i @ ((Indentation::Spaces(_), Indentation::Tabs(_))
         | (Indentation::Tabs(_), Indentation::Spaces(_))) = (indentation, &single_indent)
         {
+            // TODO: errors
             panic!(
                 "got {} instead of {} at {loc:?}",
                 i.0.as_str_name(),
@@ -1192,6 +1199,7 @@ fn get_depth_from_indent(indentation: Indentation, single_indent: Indentation, l
             )
         };
 
+    // TODO: errors
     if got_amount % single_amount != 0 {
         panic!(
             "inconsistent amount of {indent} at {loc:?}: expected {single_amount} as a single_indent, but got {got_amount} total"
