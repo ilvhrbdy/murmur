@@ -12,20 +12,8 @@ use std::path::Path;
 //          @hide
 //
 //      @jump start
-//      # which leads to inf loop of jumping to itself
-//      # same as
-//      @as aboba
-//      @jump aboba       # which is funny
-//
 //
 // i mean it is a logical error, not a problem of the language, but maybe a debuger mode for murmur cli or some sort of to debug behaviour of the script
-// we could warn for some weird behavior like this:
-//
-//      @as aboba
-//      @jump aboba
-//
-//      which is a valid murmur syntax, but just an infinite loop
-//      maybe i need to be strict with this kind of shit?
 
 // TODO: `@def <temlate name> [$args] <block>` macro and expanding it with
 //      @ <module>.<template> for expanding macro from other module
@@ -107,7 +95,7 @@ impl<State: Clone> Conversation<State> {
     }
 
     pub fn response(&self) -> Option<&str> {
-        if let Item::Response { phrase, .. } = &self.items[self.current]
+        if let Item::Response { phrase, .. } = self.items.get(self.current)?
             && !phrase.is_empty()
         {
             Some(phrase.as_str())
@@ -129,15 +117,13 @@ impl<State: Clone> Conversation<State> {
     }
 
     pub fn next_state(&mut self) -> Option<()> {
-        self.current = self.links[self.current]?;
+        self.current = self.links.get(self.current).copied()??;
         self.get_to_response()
     }
 
     pub fn next_state_from_option(&mut self, option_idx: usize) -> Option<()> {
-        let next = self
-            .options_indices()
-            .nth(option_idx)
-            .expect("valid index of an option"); // TODO: error?
+        let next = self.options_indices().nth(option_idx)?;
+        // .expect("valid index of an option"); // TODO: error?
 
         self.current = next;
         self.next_state()?;
@@ -151,13 +137,13 @@ impl<State: Clone> Conversation<State> {
             _ => unreachable!(),
         }
         .iter()
-        .filter(|opt| self.vis[**opt])
+        .filter(|&&opt| self.vis[opt])
         .copied()
     }
 
     fn get_to_response(&mut self) -> Option<()> {
         loop {
-            match &self.items[self.current] {
+            match self.items.get(self.current)? {
                 _ if !self.vis[self.current] => self.current = self.links[self.current]?,
                 Item::Response { .. } => {
                     self.update_phrases_in_state();
@@ -235,6 +221,10 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
     let out = &mut std::io::stdout();
     let mut input = String::new();
 
+    if conv.items.is_empty() {
+        return Ok(());
+    }
+
     loop {
         // println!("{:#?}", conv.vis);
         let state = conv.current;
@@ -295,7 +285,15 @@ const TEST_CONVO: &str = "
 
 @as start
 - lasdkfj @{ aboba suka blyad idi nahuy } 1 -> 16 @{ aboba salupa }
-# @jump start
+
+@as suka
+    -
+@as suka
+- ....
+
+
+# @if test
+# @jump bubu
 
 - 1 -> 16
 > 2 -> 3

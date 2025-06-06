@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    fmt,
-    iter::Peekable,
-};
+use std::{collections::HashMap, fmt, iter::Peekable};
 
 #[derive(Copy, Clone, Debug)]
 pub enum Indentation {
@@ -61,6 +57,12 @@ struct Loc {
     col: u32,
 }
 
+impl fmt::Display for Loc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.col)
+    }
+}
+
 #[derive(Debug)]
 enum TokenKind {
     Function {
@@ -70,7 +72,7 @@ enum TokenKind {
     Response(String),           // `-` - npc's response phrase in conversation
     Option(String),             // `>` - player's option in conversation
     PhraseContinuation(String), // phrases on newlines excluding indentation
-    IsolatedBlock(String),      // constructed on parsing stage (label_name)
+    IsolatedBlock(String),      // constructed on parsing stage
 }
 
 #[derive(Debug)]
@@ -244,22 +246,15 @@ pub(super) enum Item {
     Hide(Vec<usize>),
     Show(Vec<usize>),
     FunctionCall { func: usize, args: Vec<String> },
+    // If { condition_fn: usize },
+    // Elif { condition_fn: usize },
+    // Else { condition_fn: usize },
 }
 
 pub enum ReturnValue {
     Bool(bool),
     String(String),
     None,
-}
-
-impl ReturnValue {
-    fn try_into_string(self) -> Option<String> {
-        match self {
-            ReturnValue::Bool(b) => Some(b.to_string()),
-            ReturnValue::String(s) => Some(s),
-            ReturnValue::None => None,
-        }
-    }
 }
 
 impl From<bool> for ReturnValue {
@@ -305,9 +300,8 @@ struct ParserData {
     label_jumps: HashMap<usize, (Loc, String)>, // to store all jumps, before all labels are defined
     label_vis_changes: HashMap<usize, Vec<(Loc, String)>>, // to store args for `hide` or `show` funcs, before all labels are defined
 
-    entry_point: Option<usize>,
-    modules: HashMap<String, (bool, Loc)>, // keep track of what is already imported
-    local_imports: HashMap<String, HashMap<String, (bool, Loc)>>,
+    modules: HashMap<String, bool>, // keep track of what is already imported
+    local_imports: HashMap<String, HashMap<String, (Loc, bool)>>,
     load_queue: Vec<(String, Vec<Token>)>, // module name, tokens
 
     // Result
@@ -335,52 +329,49 @@ pub(super) fn parse_tokens_into_items<State: Clone>(
     }
 
     // TODO: avoid second allocation for the name
-    parser
-        .modules
-        .insert(main_module.into(), (true, Loc::default()));
+    parser.modules.insert(main_module.into(), true);
     parser.load_queue.push((main_module.into(), tokens));
 
     while !parser.load_queue.is_empty() {
-        let parsed_module = parse_module(&mut parser, &funcs_map, &funcs, state, &mut dummy_state);
-
-        if parsed_module == main_module && parser.entry_point.is_none() {
-            eprintln!(
-                "'{main_module}' module doesn't contain any entry point state, conversation cannot be started"
-            );
-            return Err(());
-        }
+        parse_module(&mut parser, &funcs_map, &funcs, state, &mut dummy_state);
     }
 
     for (module, imports) in parser.local_imports {
-        for (imp, (is_used, loc)) in imports {
+        for (imp, (loc, is_used)) in imports {
             if !is_used {
-                eprintln!("{loc:?} in `{module}` import `{imp}` was never referensed anywhere");
+                eprintln!("{loc} in `{module}` import `{imp}` was never referensed anywhere");
                 parser.failed = true;
             }
         }
     }
 
-    if parser.failed {
-        return Err(());
-    }
+    // panic!("{:#?}", parser.labels_map);
 
     for (jump_item, (loc, label)) in parser.label_jumps {
         // TODO: store location
-        let Some(target_item) = parser.labels_map.get(&label) else {
-            eprintln!("{loc:?} label doesn't exist: {label}");
-            return Err(());
+        let Some(target_item) = parser.labels_map.get(&label).copied() else {
+            eprintln!("{loc} label doesn't exist: {label}");
+            parser.failed = true;
+            continue;
         };
 
-        if let Item::Option { .. } = parser.items[*target_item] {
-            eprintln!("{loc:?} jumping on options is not allowed :(");
-            return Err(());
+        if let Item::Option { .. } = parser.items[target_item] {
+            eprintln!("{loc} jumping on options is not allowed :(");
+            parser.failed = true;
+            continue;
         }
 
         let Item::Jump(location) = &mut parser.items[jump_item] else {
             unreachable!()
         };
 
-        *location = *target_item;
+        if target_item == jump_item {
+            eprintln!("{loc} you are creating infinite loop by jumping on `jump` itself");
+            parser.failed = true;
+            continue;
+        }
+
+        *location = target_item;
     }
 
     for (vis_change_item, labels) in parser.label_vis_changes {
@@ -390,15 +381,20 @@ pub(super) fn parse_tokens_into_items<State: Clone>(
 
         for (loc, label) in labels {
             let Some(target_item) = parser.labels_map.get(&label) else {
-                eprintln!("{loc:?} label doesn't exist: {label}");
-                return Err(());
+                eprintln!("{loc} label doesn't exist: {label}");
+                parser.failed = true;
+                continue;
             };
 
             items.push(*target_item);
         }
     }
 
-    Ok((parser.items, parser.links, funcs))
+    if parser.failed {
+        Err(())
+    } else {
+        Ok((parser.items, parser.links, funcs))
+    }
 }
 
 fn parse_module<State>(
@@ -410,7 +406,6 @@ fn parse_module<State>(
         labels_map,
         label_jumps,
         label_vis_changes,
-        entry_point,
         items,
         links,
         failed,
@@ -419,7 +414,7 @@ fn parse_module<State>(
     funcs: &[Func<State>],
     state: &mut State,
     dummy_state: &mut State,
-) -> String {
+) {
     macro_rules! fail {
         () => {{
             *failed = true;
@@ -438,10 +433,10 @@ fn parse_module<State>(
     let make_label = |m: &str, l: &str| m.to_owned() + "." + l;
     // println!("{module_name} {tokens:#?}");
 
-    let mut get_depth = |indent: Indentation, loc: Loc| -> u32 {
+    let mut get_depth = |indent: Indentation, loc: Loc| -> Result<u32, ()> {
         if single_indentation.is_empty() {
             if indent.is_empty() {
-                return 0;
+                return Ok(0);
             }
 
             *single_indentation = indent;
@@ -468,7 +463,11 @@ fn parse_module<State>(
 
     while let Some(token) = tokens.next() {
         let this_item = module_items.len() + link_offset;
-        let token_depth = get_depth(token.indentation, token.loc);
+        let token_loc = token.loc;
+        let Ok(token_depth) = get_depth(token.indentation, token_loc) else {
+            fail!();
+            return;
+        };
 
         macro_rules! register_state_item {
             ($update_family:expr $(, $item:expr)?) => {{
@@ -490,8 +489,8 @@ fn parse_module<State>(
 
                 }
 
-                if let Some((_, label)) = label_to_assign.take() {
-                    let _ = labels_map.insert(label, this_item);
+                if let Some((.., label)) = label_to_assign.take() {
+                    let _ = labels_map.insert(label, this_item).is_some();
                 }
 
                 item_depth.push(token_depth);
@@ -511,6 +510,14 @@ fn parse_module<State>(
         }
 
         if let Some((label_depth, _)) = label_to_assign {
+            if label_depth > token_depth {
+                fail!(
+                    "{module_name}:{token_loc} label must be either a parent of next item to define a block or to be at the same indentation depth as the next item"
+                );
+
+                continue;
+            }
+
             // create labeled block
             if label_depth < token_depth {
                 let (label_depth, label) = label_to_assign.take().unwrap();
@@ -522,10 +529,17 @@ fn parse_module<State>(
                     token,
                 ];
 
-                while let Some(block_token) =
-                    tokens.next_if(|t| label_depth < get_depth(t.indentation, t.loc))
-                {
-                    block.push(block_token);
+                while let Some(next_t) = tokens.peek() {
+                    let Ok(next_t_depth) = get_depth(next_t.indentation, next_t.loc) else {
+                        fail!();
+                        return;
+                    };
+
+                    if label_depth < next_t_depth {
+                        block.push(tokens.next().unwrap());
+                    } else {
+                        break;
+                    }
                 }
 
                 // TODO: i thought that i could just push locala imports but at this point not all of the imports availabel
@@ -533,18 +547,12 @@ fn parse_module<State>(
                 load_queue.push((module_name.clone(), block));
 
                 continue;
-            } else if label_depth > token_depth {
-                fail!(
-                    "{:?} label must be either a parent of next item to define a block or to be at the same indentation depth as the next item",
-                    token.loc
-                );
-                continue;
             }
         }
 
         match token.kind {
             TokenKind::IsolatedBlock(label) => {
-                let _ = labels_map.insert(label, module_items.len() + link_offset);
+                *labels_map.get_mut(&label).unwrap() = module_items.len() + link_offset
             }
             TokenKind::PhraseContinuation(text) => match module_items.last_mut() {
                 Some(Item::Option { phrase, .. } | Item::Response { phrase, .. }) => {
@@ -556,17 +564,12 @@ fn parse_module<State>(
                 }
                 _ => {
                     fail!(
-                        "{:?} {text:?} must belong to `-` response or `>` option",
-                        token.loc
+                        "{module_name}:{token_loc} {text:?} must belong to `-` response or `>` option"
                     );
                     continue;
                 }
             },
             TokenKind::Response(phrase) => {
-                if entry_point.is_none() {
-                    *entry_point = Some(module_items.len() + link_offset);
-                }
-
                 register_state_item!(
                     true,
                     Item::Response {
@@ -590,8 +593,7 @@ fn parse_module<State>(
                     })
                 else {
                     fail!(
-                        "{:?} couldn't find an option handler for {phrase:?} on this depth",
-                        token.loc
+                        "{module_name}:{token_loc} couldn't find an option handler for {phrase:?} on this depth"
                     );
                     continue;
                 };
@@ -607,8 +609,7 @@ fn parse_module<State>(
                     Item::Option { .. } => unreachable!(),
                     _ => {
                         fail!(
-                            "{loc:?} options can only belong to responses, defined with `-`",
-                            loc = token.loc,
+                            "{module_name}:{token_loc} options can only belong to responses, defined with `-`"
                         );
                         continue;
                     }
@@ -617,58 +618,64 @@ fn parse_module<State>(
             TokenKind::Function { name, mut args } if name == "jump" => {
                 if args.len() > 1 {
                     fail!(
-                        "{loc:?} too many arguments for `jump` function, expected only one label",
-                        loc = token.loc
+                        "{module_name}:{token_loc} too many arguments for `jump` function, expected only one label"
                     );
                     continue;
                 }
 
-                if !func_signature_is_valid((&token.loc, &name), &args, &['.']) {
+                if !func_signature_is_valid((&token_loc, &name), &args, &['.']) {
+                    fail!();
                     continue;
                 }
 
-                let Some((label_loc, label)) = args.pop() else {
-                    fail!("{:?} expected label for `jump` function", token.loc);
+                let Some((label_loc, target)) = args.pop() else {
+                    fail!("{module_name}:{token_loc} expected label for `jump` function");
                     continue;
                 };
 
-                let mut parts = label.split('.');
+                let mut parts = target.split('.');
                 let jump_target = match (parts.next(), parts.next(), parts.next()) {
                     (.., Some(_)) => {
                         fail!(
-                            "{label_loc:?} invalid item access syntax, path may only contain one dot",
+                            "{label_loc} invalid item access syntax, path may only contain one dot"
                         );
                         continue;
                     }
+                    (Some(label), None, None) => make_label(&module_name, label),
+                    (Some(import_name), Some(label), _)
+                        if import_name == module_name || import_name.is_empty() =>
+                    {
+                        make_label(&module_name, label)
+                    }
                     (Some(import_name), Some(import_label), _) => {
-                        if let Some((is_used, _)) = local_imports
+                        if let Some((_, is_used)) = local_imports
                             .get_mut(&module_name)
                             .and_then(|imports| imports.get_mut(import_name))
                         {
                             *is_used = true;
                         } else {
                             fail!(
-                                "{label_loc:?} in `{module_name}`: `{import_name}` is not imported, so can't access `{import_label}` item",
+                                "{label_loc} in `{module_name}`: `{import_name}` is not imported, so can't access `{import_label}` item"
                             );
                             continue;
                         }
 
-                        let (is_loaded, _) = modules
+                        let is_loaded = modules
                             .get_mut(import_name)
                             .expect("import is registered in both `modules` and `local_imports`");
 
                         if !*is_loaded {
-                            let src =
-                                match crate::utils::read_mur_file(format!("{import_name}.mur")) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        fail!(
-                                            "{:?} can't jump on imported label '{label}': {e}",
-                                            token.loc
-                                        );
-                                        continue;
-                                    }
-                                };
+                            let src = match crate::utils::read_mur_file(format!(
+                                "{import_name}.mur"
+                            )) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    fail!(
+                                        "{module_name}:{token_loc} can't jump on imported label '{target}': {e}"
+                                    );
+                                    continue;
+                                }
+                            };
 
                             let import_tokens = tokenize(&src);
 
@@ -676,9 +683,8 @@ fn parse_module<State>(
                             *is_loaded = true;
                         }
 
-                        label
+                        target
                     }
-                    (Some(label), None, _) => make_label(&module_name, label),
                     _ => unreachable!(),
                 };
                 assert!(
@@ -694,67 +700,62 @@ fn parse_module<State>(
                 if args.len() > 1 {
                     let (loc, _) = args[1];
 
-                    fail!("{loc:?} too many arguments for `as` function, expected only one label",);
+                    fail!("{loc} too many arguments for `as` function, expected only one label");
                     continue;
                 }
 
-                if !func_signature_is_valid((&token.loc, &name), &args, &[]) {
+                if !func_signature_is_valid((&token_loc, &name), &args, &[]) {
+                    fail!();
                     continue;
                 }
 
-                let Some((_, label)) = args.pop() else {
-                    fail!(
-                        "{loc:?} expected label name for `as` function",
-                        loc = token.loc
-                    );
+                let Some((label_loc, label)) = args.pop() else {
+                    fail!("{module_name}:{token_loc} expected label name for `as` function");
                     continue;
                 };
 
                 if label_to_assign.is_some() {
-                    fail!("function `as` cannot be labeled");
+                    fail!("{module_name}:{token_loc} function `as` cannot be labeled");
                     continue;
                 }
 
                 if tokens.peek().is_none() {
-                    fail!("standalone `as` function is not allowed");
+                    fail!("{module_name}:{token_loc} standalone `as` function is not allowed");
                     continue;
                 }
 
                 let name = make_label(&module_name, &label);
 
                 if labels_map.contains_key(&name) {
-                    fail!("duplicate label: {label}");
+                    fail!("{module_name}:{label_loc} duplicate label `{label}`");
                     continue;
                 }
 
-                label_to_assign = Some((token_depth, name));
+                label_to_assign = Some((token_depth, name.clone()));
+                // register label just to be able to catch redefinition
+                // later items will assign their indices to the label
+                labels_map.insert(name, 0);
             }
             TokenKind::Function { name, mut args } if name == "import" => {
                 if args.len() > 1 {
                     fail!(
-                        "{loc:?} too many arguments for `import` function, expected only one module name",
-                        loc = token.loc
+                        "{module_name}:{token_loc} too many arguments for `import` function, expected only one module name",
                     );
                     continue;
                 }
 
-                if !func_signature_is_valid((&token.loc, &name), &args, &[]) {
+                if !func_signature_is_valid((&token_loc, &name), &args, &[]) {
+                    fail!();
                     continue;
                 }
 
                 if label_to_assign.is_some() {
-                    fail!(
-                        "{loc:?} cannot assign label to the `import` function",
-                        loc = token.loc
-                    );
+                    fail!("{module_name}:{token_loc} cannot assign label to the `import` function",);
                     continue;
                 }
 
                 let Some((module_name_loc, module)) = args.pop() else {
-                    fail!(
-                        "{loc:?} expected module name for `import` function",
-                        loc = token.loc
-                    );
+                    fail!("{module_name}:{token_loc} expected module name for `import` function",);
                     continue;
                 };
 
@@ -762,27 +763,28 @@ fn parse_module<State>(
                     fail!("{:?} self import is weird", module_name_loc);
                     continue;
                 } else {
-                    if let Entry::Vacant(e) = modules.entry(module.clone()) {
-                        e.insert((false, module_name_loc));
+                    if !modules.contains_key(&module) {
+                        modules.insert(module.clone(), false);
                     }
 
                     if let Some(imps) = local_imports.get_mut(&module_name) {
-                        if let Some((m, prev_loc)) = imps.insert(module, (false, module_name_loc)) {
+                        if let Some((prev_loc, m)) = imps.insert(module, (module_name_loc, false)) {
                             fail!(
-                                "{:?} duplicate import `{m}`, previous import at {prev_loc:?}",
+                                "{:?} duplicate import `{m}`, previous import at {prev_loc}",
                                 module_name_loc
                             );
                         }
                     } else {
                         local_imports.insert(
                             module_name.clone(),
-                            [(module, (false, module_name_loc))].into(),
+                            [(module, (module_name_loc, false))].into(),
                         );
                     }
                 }
             }
             TokenKind::Function { name, mut args } if name == "hide" || name == "show" => {
-                if !func_signature_is_valid((&token.loc, &name), &args, &['.']) {
+                if !func_signature_is_valid((&token_loc, &name), &args, &['.']) {
+                    fail!();
                     continue;
                 }
 
@@ -791,8 +793,7 @@ fn parse_module<State>(
                 let target_items = if args.is_empty() {
                     let Some(parent) = parents[this_item] else {
                         fail!(
-                            "{:?} this `hide` function without arguments affect it's parent, which is not present in our case :(",
-                            token.loc
+                            "{module_name}:{token_loc} this `hide` function without arguments affect it's parent, which is not present in our case :(",
                         );
                         continue;
                     };
@@ -814,27 +815,37 @@ fn parse_module<State>(
                     _ => unreachable!(),
                 }
             }
+            // TokenKind::Function { name, args } if name == "def" => {
+            // }
+            // Custom function
             TokenKind::Function { name, args } => {
                 let (is_comptime_call, fn_name) = name
                     .strip_prefix('!')
                     .map_or((false, name.as_str()), |rest| (true, rest));
 
-                let Some(func) = funcs_map.get(fn_name).copied() else {
-                    fail!("{:?} function `{fn_name}` is undefined", token.loc);
-                    continue;
-                };
-
-                if !func_signature_is_valid((&token.loc, fn_name), &args, &[]) {
+                if !func_signature_is_valid((&token_loc, fn_name), &args, &[]) {
+                    fail!();
                     continue;
                 }
+
+                let Some(func) = funcs_map.get(fn_name).copied() else {
+                    // TODO: lame + we need to validate that user didn't define a custom func with the name of builtin func
+                    if is_comptime_call {
+                        fail!(
+                            "{module_name}:{token_loc} either function `{fn_name}` is undefined or you trying to call builting function with `!` compile time preffix, which is not allowed"
+                        );
+                    } else {
+                        fail!("{module_name}:{token_loc} function `{fn_name}` is undefined");
+                    }
+                    continue;
+                };
 
                 let args = args.into_iter().map(|(_, a)| a).collect::<Vec<String>>();
 
                 if is_comptime_call {
                     if label_to_assign.is_some() {
                         fail!(
-                            "{:?} you cannot assign label for compile time function, it will not be present at runtime, bruh, obviously",
-                            token.loc
+                            "{module_name}:{token_loc} you cannot assign label for compile time function, it will not be present at runtime, bruh, obviously",
                         );
                         continue;
                     }
@@ -847,7 +858,7 @@ fn parse_module<State>(
             }
         }
 
-        prev_token_loc = token.loc;
+        prev_token_loc = token_loc;
     }
 
     let module_links = link_state_items(
@@ -860,8 +871,6 @@ fn parse_module<State>(
 
     links.extend(module_links);
     items.extend(module_items);
-
-    module_name
 }
 
 #[derive(Debug)]
@@ -998,12 +1007,12 @@ fn parse_phrase<State>(
         }
 
         let Some(func_args) = collect_func(&mut stream) else {
-            eprintln!("{next_ch_loc:?} could not find '}}' delimiter");
+            eprintln!("{next_ch_loc} could not find '}}' delimiter");
             return Err(());
         };
 
         let Some(((func_loc, name), args)) = func_args.split_first() else {
-            eprintln!("{next_ch_loc:?} expected function name within `@{{}}`");
+            eprintln!("{next_ch_loc} expected function name within `@{{}}`");
             failed = true;
             continue;
         };
@@ -1015,7 +1024,7 @@ fn parse_phrase<State>(
             .map_or((false, name.as_str()), |rest| (true, rest));
 
         let Some(func) = funcs_map.get(fn_name).copied() else {
-            eprintln!("{func_loc:?} function `{fn_name}` is undefined");
+            eprintln!("{func_loc} function `{fn_name}` is undefined");
             failed = true;
             continue;
         };
@@ -1032,8 +1041,8 @@ fn parse_phrase<State>(
             .collect::<Vec<String>>();
 
         if is_comptime_call {
-            let Some(output) = (funcs[func])(state, &args).try_into_string() else {
-                eprintln!("{func_loc:?} this function doesn't return a displayable value");
+            let ReturnValue::String(output) = (funcs[func])(state, &args) else {
+                eprintln!("{func_loc} this function doesn't return a displayable value");
                 failed = true;
                 continue;
             };
@@ -1044,11 +1053,8 @@ fn parse_phrase<State>(
                 parts.push(PhraseParts::Static(output));
             }
         } else {
-            if (funcs[func])(dummy_state, &args)
-                .try_into_string()
-                .is_none()
-            {
-                eprintln!("{func_loc:?} function doesn't return a displayable value");
+            if !matches!((funcs[func])(dummy_state, &args), ReturnValue::String(_)) {
+                eprintln!("{func_loc} function doesn't return a displayable value");
                 failed = true;
                 continue;
             };
@@ -1090,24 +1096,21 @@ fn func_signature_is_valid<'s>(
     let mut valid = true;
     let errors = std::iter::once(func)
         .chain(args.iter().map(|(loc, arg)| (loc, arg.as_str())))
-        .filter_map(|(loc, word)| {
-            let (ch_idx, ch) = word
-                .chars()
-                .enumerate()
-                .find(|(_, ch)| !exceptions.contains(ch) && RESTRICTED_CHARS.contains(ch))?;
-
-            Some((
-                Loc {
-                    col: loc.col + ch_idx as u32,
-                    ..*loc
-                },
-                ch,
-            ))
+        .flat_map(|(&loc, word)| {
+            word.chars().enumerate().filter_map(move |(ch_idx, ch)| {
+                (RESTRICTED_CHARS.contains(&ch) && !exceptions.contains(&ch)).then_some((
+                    Loc {
+                        col: loc.col + ch_idx as u32,
+                        ..loc
+                    },
+                    ch,
+                ))
+            })
         });
 
     for (err_loc, err_char) in errors {
         eprintln!(
-            "{err_loc:?} unacceptable character in function signature `{f}`: '{err_char}'",
+            "{err_loc} unacceptable character in function signature `{f}`: '{err_char}'",
             f = func.1,
         );
         valid = false
@@ -1146,9 +1149,25 @@ fn link_state_items(
         let this_state = states[i];
 
         let maybe_options = match &items[this_state] {
+            // If { .. } => {
+            //     // TODO:
+            //     let potential_link = states[i + 1..].iter().find_map(|&&s| {
+            //         if item_depth[s] < item_depth[this_state] || item_depth[s] > item_depth[this_state] {
+            //             return Some(Err(()));
+            //         }
+
+            //         (item_depth[i] == item_depth[this_state]).then_some(Ok(i))
+            //     });
+
+            //     match potential_link {
+            //         Some(Ok(item)) = links[this_state] = Some(itme),
+            //         Some(Err(())) | None => links[this_state] = None,
+            //     }
+            // }
             Item::Response { options, .. } => Some(options),
             Item::FunctionCall { .. } | Item::Jump(_) | Item::Hide(_) | Item::Show(_) => None,
             Item::Option { .. } => unreachable!(),
+            // _ => todo!(),
         };
 
         if links[this_state].is_some()
@@ -1180,33 +1199,36 @@ fn link_state_items(
     links
 }
 
-fn get_depth_from_indent(indentation: Indentation, single_indent: Indentation, loc: Loc) -> u32 {
-    let (got_amount, single_amount, indent) =
-        if let i @ ((Indentation::Spaces(_), Indentation::Tabs(_))
-        | (Indentation::Tabs(_), Indentation::Spaces(_))) = (indentation, &single_indent)
-        {
-            // TODO: errors
-            panic!(
-                "got {} instead of {} at {loc:?}",
-                i.0.as_str_name(),
-                i.1.as_str_name()
-            )
-        } else {
-            (
-                indentation.get_amount(),
-                single_indent.get_amount(),
-                single_indent.as_str_name(),
-            )
-        };
+fn get_depth_from_indent(
+    indentation: Indentation,
+    single_indent: Indentation,
+    loc: Loc,
+) -> Result<u32, ()> {
+    if let (Indentation::Spaces(_), Indentation::Tabs(_))
+    | (Indentation::Tabs(_), Indentation::Spaces(_)) = (indentation, &single_indent)
+    {
+        // TODO: errors
+        eprintln!(
+            "{loc} got {} instead of {}",
+            indentation.as_str_name(),
+            single_indent.as_str_name(),
+        );
+        return Err(());
+    }
+
+    let got_amount = indentation.get_amount();
+    let single_amount = single_indent.get_amount();
+    let indent = single_indent.as_str_name();
 
     // TODO: errors
     if got_amount % single_amount != 0 {
-        panic!(
-            "inconsistent amount of {indent} at {loc:?}: expected {single_amount} as a single_indent, but got {got_amount} total"
+        eprintln!(
+            "{loc} inconsistent amount of {indent}: expected {single_amount} as a single_indent, but got {got_amount} total"
         );
+        return Err(());
     }
 
-    got_amount / single_amount
+    Ok(got_amount / single_amount)
 }
 
 fn welcome_to_the_family(
