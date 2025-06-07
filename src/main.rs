@@ -1,7 +1,7 @@
 mod lexer;
 mod utils;
 
-use lexer::{Func, Item, Phrase, ReturnValue};
+use lexer::{Func, FuncData, Item, Phrase, ReturnValue};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -44,7 +44,7 @@ pub struct Conversation<State> {
     current: usize,
 }
 
-// only to shut the linter, see no point in having error types anyway in my case
+// only to shut the linter, see no point in having error types anyway in our case
 pub enum Error {
     ReadingInputFile,
     ParsingSource,
@@ -123,8 +123,6 @@ impl<State: Clone> Conversation<State> {
 
     pub fn next_state_from_option(&mut self, option_idx: usize) -> Option<()> {
         let next = self.options_indices().nth(option_idx)?;
-        // .expect("valid index of an option"); // TODO: error?
-
         self.current = next;
         self.next_state()?;
 
@@ -168,8 +166,8 @@ impl<State: Clone> Conversation<State> {
                     // println!("jumping to {target}");
                     self.current = *target;
                 }
-                Item::FunctionCall { func, args } => {
-                    (self.funcs[*func])(&mut self.state, args);
+                Item::FunctionCall { func, func_data } => {
+                    (self.funcs[*func])(&mut self.state, func_data);
                     self.current = self.links[self.current]?;
                 }
                 Item::Option { .. } => unreachable!(),
@@ -231,7 +229,7 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
 
         write!(out, "- ")?;
         if let Some(phrase) = conv.response() {
-            write!(out, "{phrase:?}")?;
+            write!(out, "{phrase}")?;
         }
 
         write!(out, " [{state} -> ")?;
@@ -275,6 +273,10 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
 
 // TODO: tell when import is unused
 const TEST_CONVO: &str = "
+-       1 -> 16 @{
+
+    chel }
+
 # nice
 
 @import test
@@ -284,9 +286,9 @@ const TEST_CONVO: &str = "
     @jump test.Test # 24 -> 0
 
 @as start
-- lasdkfj @{ aboba suka blyad idi nahuy } 1 -> 16 @{ aboba salupa }
+- lasdkfj @{   dura suka } 1 -> 16 @{ boba salupa }
 
-@as suka
+@!as s@u.ka kuka
     -
 @as suka
 - ....
@@ -295,7 +297,9 @@ const TEST_CONVO: &str = "
 # @if test
 # @jump bubu
 
-- 1 -> 16
+-       1 -> 16 @{
+
+    chel }
 > 2 -> 3
     - 3 -> 16
     > 4 -> 5
@@ -320,16 +324,31 @@ const TEST_CONVO: &str = "
     > 19 -> 20
 
 - 20 -> 21 which is a jump to a test.mur file -> 22
-@jump test.Test # 23 -> 24 which is in test.mur file
+@ jump test.Test # 23 -> 24 which is in test.mur file
 ";
 
-fn test(_: &mut usize, _args: &[String]) -> ReturnValue {
+const TEST_CONVO2: &str = "
+@
+- hello
+
+            @{
+                test
+
+            }
+
+        world";
+
+fn test(_: &mut usize, func: &FuncData) -> ReturnValue {
+    if func.is_comptime {
+        println!("calling function once");
+    }
+
     "hello".into()
 }
 
 fn main() {
     let Ok(convo) =
-        Conversation::from_source(TEST_CONVO, "main", [("aboba", test as _)].into(), 0usize)
+        Conversation::from_source(TEST_CONVO2, "main", [("test", test as _)].into(), 0usize)
     // Conversation::load("test2.mur", [("aboba", test as _)].into(), 0usize)
     else {
         return;

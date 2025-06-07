@@ -85,7 +85,7 @@ Here you can get a sense of the logic of state transitioning:
 ```
 
 ## Functions
-#### `@<func> [args] ...`
+#### `@<func> [args ...]`
 Calls a custom function, Where `func` is not one of the built-ins. Your custom functions will be defined via `HashMap<&str, fn(&mut YourCustomState, &[String]) -> _` that you pass to the parser.
 ```rust
 fn tell_a_joke(my_state: &mut MyState, args: &[String]) -> ReturnValue {
@@ -154,7 +154,7 @@ In the `angry.mur` file:
 - Come closer..
 ```
 
-#### `@hide [labels] ...` / `@show [labels] ...`
+#### `@hide [labels ...]` / `@show [labels ...]`
 Will disable/enable the specified items, causing them to be skipped. If no labels are specified, they will disable/enable the parent item:
 ```
 # Useful for "wiki"-style dialogues like this
@@ -178,7 +178,7 @@ Will disable/enable the specified items, causing them to be skipped. If no label
 @show where how_much
 @jump useful_convo
 ```
-#### String interpolation using `@{<func> [args] ...}`
+#### String interpolation using `@{<func> [args ...]}`
 Used in options and responses. This works the same way as calling inline functions. For example, `@{ func }` is evaluated each time it occurs, whereas `@{ !func }` constructs a static string:
 ```
 - {!player_name}, you are @{random_insult}!
@@ -205,7 +205,7 @@ within a string interpolation, chunk is expanded as a plain string:
 
 - Man, you smell like @{.smell}!
 
-@ .smell # parsing error if `psina` is not defined
+@ .smell # this will put "psina" text in place of `@` and try to parse it as a murmur script
 ```
 
 

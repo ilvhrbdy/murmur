@@ -1,28 +1,35 @@
 use std::{collections::HashMap, fmt, iter::Peekable};
 
 #[derive(Copy, Clone, Debug)]
-pub enum Indentation {
+enum Indentation {
     Spaces(u32),
     Tabs(u32),
 }
 
 impl Indentation {
-    pub fn empty() -> Self {
+    fn empty() -> Self {
         Indentation::Spaces(0)
     }
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.get_amount() == 0
     }
 
-    pub fn get_amount(&self) -> u32 {
+    fn get_amount(&self) -> u32 {
         let (Indentation::Tabs(n) | Indentation::Spaces(n)) = self;
         *n
     }
 
-    pub fn get_mut_amount(&mut self) -> &mut u32 {
+    fn get_mut_amount(&mut self) -> &mut u32 {
         let (Indentation::Tabs(n) | Indentation::Spaces(n)) = self;
         n
+    }
+
+    fn as_string(&self) -> String {
+        match self {
+            Indentation::Spaces(n) => " ".repeat(*n as _),
+            Indentation::Tabs(n) => "\t".repeat(*n as _),
+        }
     }
 
     fn as_str_name(&self) -> &str {
@@ -66,14 +73,61 @@ impl fmt::Display for Loc {
 #[derive(Debug)]
 enum TokenKind {
     Function {
-        name: String,
+        kind: FunctionKind,
         args: Vec<(Loc, String)>,
+        is_comptime: bool,
     },
     Response(String),           // `-` - npc's response phrase in conversation
     Option(String),             // `>` - player's option in conversation
     PhraseContinuation(String), // phrases on newlines excluding indentation
     IsolatedBlock(String),      // constructed on parsing stage
 }
+
+macro_rules! funcs_registry {
+    (
+        $( $builtin:ident = $builtin_str:expr, )*
+    ) => {
+        #[derive(Debug, Clone)]
+        enum FunctionKind {
+            $( $builtin ,)*
+            Custom(String),
+        }
+
+        impl FunctionKind {
+            const BUILTINS: &[FunctionKind] = &[$( FunctionKind::$builtin, )*];
+            const BUILTINS_STR: &[&str] = &[$( $builtin_str, )*];
+
+            fn from_str(this: &str) -> Self {
+                Self::BUILTINS_STR
+                    .iter()
+                    .position(|builtin| &this == builtin)
+                    .map(|i| Self::BUILTINS[i].clone())
+                    .unwrap_or_else(|| Self::Custom(this.to_owned()))
+            }
+        }
+
+        impl fmt::Display for FunctionKind {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "{}",
+                    match self {
+                        FunctionKind::Custom(name) => name.as_str(),
+                        $( FunctionKind::$builtin => $builtin_str, )*
+                    }
+                )
+            }
+        }
+    }
+}
+
+funcs_registry!(
+    As = "as",
+    Jump = "jump",
+    Hide = "hide",
+    Show = "show",
+    Import = "import",
+);
 
 #[derive(Debug)]
 pub(super) struct Token {
@@ -109,11 +163,11 @@ fn collect_phrase<'s>(
     src: &'s str,
     stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
 ) -> Option<(Loc, &'s str)> {
-    while let Some((_, ch, loc)) = stream.next_if(|(_, ch, _)| ch.is_whitespace()) {
-        if ch == '\n' {
-            return Some((loc, ""));
-        }
-    }
+    // while let Some((_, ch, loc)) = stream.next_if(|(_, ch, _)| ch.is_whitespace()) {
+    //     if ch == '\n' {
+    //         return Some((loc, "\n"));
+    //     }
+    // }
 
     let (phrase_start, _, loc) = stream.peek().copied()?;
     let mut phrase_end: usize = phrase_start;
@@ -174,54 +228,65 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
         .peekable();
 
     loop {
+        // TODO: this is collecting indentation for the PhraseContinuation, which i need when pointing on errors within string interpolation...
         let Some(indentation) = collect_indent(&mut stream) else {
             break;
         };
 
-        let Some((_, ch, loc)) = stream.peek().copied() else {
+        let Some((_, ch, _)) = stream.next() else {
             break;
         };
 
         let token = match ch {
             '#' => {
-                let _ = stream.next();
                 let _ = collect_phrase(src, &mut stream);
                 continue;
             }
-            '\n' => {
-                let _ = stream.next();
-                continue;
-            }
-            '@' => {
-                let _ = stream.next();
-                let (fn_loc, name) = collect_word(&mut stream).unwrap_or((loc, String::new()));
+            '@' if stream.peek().is_some_and(|(_, next_ch, _)| *next_ch != '{') => {
+                let Some((fn_loc, name)) = collect_word(&mut stream) else {
+                    continue;
+                };
+                let (is_comptime, fn_name) = name
+                    .strip_prefix('!')
+                    .map_or((false, name.as_str()), |rest| (true, rest));
+
+                let kind = FunctionKind::from_str(fn_name);
                 let mut args = Vec::<(Loc, String)>::new();
 
-                let mut collect = true;
+                let mut collecting = true;
                 while let Some(arg) = collect_word(&mut stream) {
                     if arg.1.starts_with("#") {
-                        collect = false
+                        collecting = false // but continue draining our stream
                     }
 
-                    if collect {
+                    if collecting {
                         args.push(arg);
                     }
                 }
 
-                Some((fn_loc, TokenKind::Function { name, args }))
+                Some((
+                    fn_loc,
+                    TokenKind::Function {
+                        kind,
+                        args,
+                        is_comptime,
+                    },
+                ))
             }
-            '>' => {
-                let _ = stream.next();
-                collect_phrase(src, &mut stream)
-                    .map(|(loc, phrase)| (loc, TokenKind::Option(phrase.into())))
-            }
-            '-' => {
-                let _ = stream.next();
-                collect_phrase(src, &mut stream)
-                    .map(|(loc, phrase)| (loc, TokenKind::Response(phrase.into())))
-            }
-            _ => collect_phrase(src, &mut stream)
-                .map(|(loc, phrase)| (loc, TokenKind::PhraseContinuation(phrase.into()))),
+            '>' => collect_phrase(src, &mut stream)
+                .map(|(loc, phrase)| (loc, TokenKind::Option(phrase.into()))),
+            '-' => collect_phrase(src, &mut stream)
+                .map(|(loc, phrase)| (loc, TokenKind::Response(phrase.into()))),
+            _ => collect_phrase(src, &mut stream).map(|(loc, phrase)| {
+                let mut char_buf = [0u8; 4];
+                (
+                    loc,
+                    // putting indentation back, so later on string interpolation we could report correct location of an error
+                    TokenKind::PhraseContinuation(
+                        indentation.as_string() + ch.encode_utf8(&mut char_buf) + phrase,
+                    ),
+                )
+            }),
         };
 
         let Some((loc, kind)) = token else {
@@ -245,10 +310,16 @@ pub(super) enum Item {
     Jump(usize),
     Hide(Vec<usize>),
     Show(Vec<usize>),
-    FunctionCall { func: usize, args: Vec<String> },
+    FunctionCall { func: usize, func_data: FuncData },
     // If { condition_fn: usize },
     // Elif { condition_fn: usize },
     // Else { condition_fn: usize },
+}
+
+#[derive(Debug)]
+pub struct FuncData {
+    pub is_comptime: bool,
+    pub args: Vec<String>,
 }
 
 pub enum ReturnValue {
@@ -291,7 +362,7 @@ impl fmt::Display for ReturnValue {
     }
 }
 
-pub(super) type Func<State> = fn(&mut State, args: &[String]) -> ReturnValue;
+pub(super) type Func<State> = fn(&mut State, &FuncData) -> ReturnValue;
 
 #[derive(Default)]
 struct ParserData {
@@ -459,36 +530,58 @@ fn parse_module<State>(
     let mut module_items = Vec::<Item>::new();
     let mut label_to_assign = None::<(u32, String)>;
     let mut tokens = tokens.into_iter().peekable();
-    let mut prev_token_loc = Loc { line: 0, col: 0 };
 
     while let Some(token) = tokens.next() {
         let this_item = module_items.len() + link_offset;
         let token_loc = token.loc;
+
+        if let TokenKind::PhraseContinuation(text) = token.kind {
+            if !text.trim().is_empty() {
+                fail!(
+                    "{module_name}:{token_loc} {text:?} must belong to `-` response or `>` option"
+                );
+            }
+
+            continue;
+        }
+
         let Ok(token_depth) = get_depth(token.indentation, token_loc) else {
             fail!();
-            return;
+            continue;
         };
+
+        macro_rules! collect_whole_phrase {
+            ($input:expr) => {{
+                let mut p = $input;
+
+                while let Some(Token {
+                    kind: TokenKind::PhraseContinuation(text),
+                    ..
+                }) = tokens.peek()
+                {
+                    p.push_str(&text);
+                    let _ = tokens.next();
+                }
+
+                if let Ok(parsed_phrase) = parse_phrase(
+                    &module_name,
+                    token_loc,
+                    &p,
+                    funcs_map,
+                    funcs,
+                    state,
+                    dummy_state,
+                ) {
+                    parsed_phrase
+                } else {
+                    fail!();
+                    Phrase::Static(p)
+                }
+            }};
+        }
 
         macro_rules! register_state_item {
             ($update_family:expr $(, $item:expr)?) => {{
-                if let Some(Item::Option { phrase, .. } | Item::Response { phrase, .. }) =
-                    module_items.last_mut()
-                {
-                    let Phrase::Static(text) = phrase else {
-                        unreachable!();
-                    };
-
-                    crate::utils::trim_end(text);
-
-                    // TODO: abort compilation on error
-                    if let Ok(parsed_phrase) = parse_phrase(prev_token_loc, text, funcs_map, funcs, state, dummy_state) {
-                        *phrase = parsed_phrase;
-                    } else {
-                        fail!();
-                    }
-
-                }
-
                 if let Some((.., label)) = label_to_assign.take() {
                     let _ = labels_map.insert(label, this_item).is_some();
                 }
@@ -514,7 +607,6 @@ fn parse_module<State>(
                 fail!(
                     "{module_name}:{token_loc} label must be either a parent of next item to define a block or to be at the same indentation depth as the next item"
                 );
-
                 continue;
             }
 
@@ -551,34 +643,22 @@ fn parse_module<State>(
         }
 
         match token.kind {
+            TokenKind::PhraseContinuation(_) => unreachable!(),
             TokenKind::IsolatedBlock(label) => {
                 *labels_map.get_mut(&label).unwrap() = module_items.len() + link_offset
             }
-            TokenKind::PhraseContinuation(text) => match module_items.last_mut() {
-                Some(Item::Option { phrase, .. } | Item::Response { phrase, .. }) => {
-                    let Phrase::Static(p) = phrase else {
-                        unreachable!();
-                    };
-
-                    p.push_str(&text);
-                }
-                _ => {
-                    fail!(
-                        "{module_name}:{token_loc} {text:?} must belong to `-` response or `>` option"
-                    );
-                    continue;
-                }
-            },
             TokenKind::Response(phrase) => {
+                let phrase = collect_whole_phrase!(phrase);
                 register_state_item!(
                     true,
                     Item::Response {
-                        phrase: Phrase::Static(phrase),
+                        phrase,
                         options: Vec::new(),
                     }
                 );
             }
             TokenKind::Option(phrase) => {
+                let phrase = collect_whole_phrase!(phrase);
                 register_state_item!(false);
 
                 let Some(Ok(opt_handler)) = (0..module_items.len())
@@ -600,9 +680,7 @@ fn parse_module<State>(
 
                 sibling_idx.push(sibling_idx[opt_handler]);
                 parents.push(Some(opt_handler));
-                module_items.push(Item::Option {
-                    phrase: Phrase::Static(phrase),
-                });
+                module_items.push(Item::Option { phrase });
 
                 match &mut module_items[opt_handler] {
                     Item::Response { options, .. } => options.push(this_item),
@@ -615,21 +693,29 @@ fn parse_module<State>(
                     }
                 };
             }
-            TokenKind::Function { name, mut args } if name == "jump" => {
-                if args.len() > 1 {
+            TokenKind::Function {
+                kind: kind @ FunctionKind::Jump,
+                mut args,
+                is_comptime,
+            } => {
+                if is_comptime {
                     fail!(
-                        "{module_name}:{token_loc} too many arguments for `jump` function, expected only one label"
-                    );
-                    continue;
+                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
+                    )
                 }
 
-                if !func_signature_is_valid((&token_loc, &name), &args, &['.']) {
+                if args.len() > 1 {
+                    fail!(
+                        "{module_name}:{token_loc} too many arguments for `{kind}` function, expected only one label"
+                    );
+                }
+
+                if !func_signature_is_valid(&module_name, &args, &['.']) {
                     fail!();
-                    continue;
                 }
 
                 let Some((label_loc, target)) = args.pop() else {
-                    fail!("{module_name}:{token_loc} expected label for `jump` function");
+                    fail!("{module_name}:{token_loc} expected label for `{kind}` function");
                     continue;
                 };
 
@@ -637,7 +723,7 @@ fn parse_module<State>(
                 let jump_target = match (parts.next(), parts.next(), parts.next()) {
                     (.., Some(_)) => {
                         fail!(
-                            "{label_loc} invalid item access syntax, path may only contain one dot"
+                            "{label_loc} invalid item access syntax for label, path may only contain one dot: '<module>.<label>'"
                         );
                         continue;
                     }
@@ -657,7 +743,6 @@ fn parse_module<State>(
                             fail!(
                                 "{label_loc} in `{module_name}`: `{import_name}` is not imported, so can't access `{import_label}` item"
                             );
-                            continue;
                         }
 
                         let is_loaded = modules
@@ -696,17 +781,26 @@ fn parse_module<State>(
 
                 register_state_item!(true, Item::Jump(0));
             }
-            TokenKind::Function { name, mut args } if name == "as" => {
-                if args.len() > 1 {
-                    let (loc, _) = args[1];
-
-                    fail!("{loc} too many arguments for `as` function, expected only one label");
-                    continue;
+            TokenKind::Function {
+                kind: kind @ FunctionKind::As,
+                is_comptime,
+                mut args,
+            } => {
+                if is_comptime {
+                    fail!(
+                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
+                    )
                 }
 
-                if !func_signature_is_valid((&token_loc, &name), &args, &[]) {
+                if args.len() > 1 {
+                    let (loc, _) = args[1];
+                    fail!(
+                        "{module_name}:{loc} too many arguments for `as` function, expected only one label"
+                    );
+                }
+
+                if !func_signature_is_valid(&module_name, &args, &[]) {
                     fail!();
-                    continue;
                 }
 
                 let Some((label_loc, label)) = args.pop() else {
@@ -716,19 +810,16 @@ fn parse_module<State>(
 
                 if label_to_assign.is_some() {
                     fail!("{module_name}:{token_loc} function `as` cannot be labeled");
-                    continue;
                 }
 
                 if tokens.peek().is_none() {
                     fail!("{module_name}:{token_loc} standalone `as` function is not allowed");
-                    continue;
                 }
 
                 let name = make_label(&module_name, &label);
 
                 if labels_map.contains_key(&name) {
                     fail!("{module_name}:{label_loc} duplicate label `{label}`");
-                    continue;
                 }
 
                 label_to_assign = Some((token_depth, name.clone()));
@@ -736,54 +827,70 @@ fn parse_module<State>(
                 // later items will assign their indices to the label
                 labels_map.insert(name, 0);
             }
-            TokenKind::Function { name, mut args } if name == "import" => {
-                if args.len() > 1 {
+            TokenKind::Function {
+                kind: kind @ FunctionKind::Import,
+                mut args,
+                is_comptime,
+            } => {
+                if is_comptime {
                     fail!(
-                        "{module_name}:{token_loc} too many arguments for `import` function, expected only one module name",
-                    );
-                    continue;
+                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
+                    )
                 }
 
-                if !func_signature_is_valid((&token_loc, &name), &args, &[]) {
+                if args.len() > 1 {
+                    fail!(
+                        "{module_name}:{token_loc} too many arguments for `{kind}` function, expected only one module name",
+                    );
+                }
+
+                if !func_signature_is_valid(&module_name, &args, &[]) {
                     fail!();
-                    continue;
                 }
 
                 if label_to_assign.is_some() {
-                    fail!("{module_name}:{token_loc} cannot assign label to the `import` function",);
-                    continue;
+                    fail!("{module_name}:{token_loc} cannot assign label to the `{kind}` function",);
                 }
 
                 let Some((module_name_loc, module)) = args.pop() else {
-                    fail!("{module_name}:{token_loc} expected module name for `import` function",);
+                    fail!("{module_name}:{token_loc} expected module name for `{kind}` function",);
                     continue;
                 };
 
                 if module == module_name {
                     fail!("{:?} self import is weird", module_name_loc);
                     continue;
-                } else {
-                    if !modules.contains_key(&module) {
-                        modules.insert(module.clone(), false);
-                    }
+                }
+                if !modules.contains_key(&module) {
+                    modules.insert(module.clone(), false);
+                }
 
-                    if let Some(imps) = local_imports.get_mut(&module_name) {
-                        if let Some((prev_loc, m)) = imps.insert(module, (module_name_loc, false)) {
-                            fail!(
-                                "{:?} duplicate import `{m}`, previous import at {prev_loc}",
-                                module_name_loc
-                            );
-                        }
-                    } else {
-                        local_imports.insert(
-                            module_name.clone(),
-                            [(module, (module_name_loc, false))].into(),
+                if let Some(imps) = local_imports.get_mut(&module_name) {
+                    if let Some((prev_loc, m)) = imps.insert(module, (module_name_loc, false)) {
+                        fail!(
+                            "{:?} duplicate import `{m}`, previous import at {prev_loc}",
+                            module_name_loc
                         );
                     }
+                } else {
+                    local_imports.insert(
+                        module_name.clone(),
+                        [(module, (module_name_loc, false))].into(),
+                    );
                 }
             }
-            TokenKind::Function { name, mut args } if name == "hide" || name == "show" => {
-                if !func_signature_is_valid((&token_loc, &name), &args, &['.']) {
+            TokenKind::Function {
+                kind: kind @ (FunctionKind::Hide | FunctionKind::Show),
+                mut args,
+                is_comptime,
+            } => {
+                if is_comptime {
+                    fail!(
+                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
+                    )
+                }
+
+                if !func_signature_is_valid(&module_name, &args, &['.']) {
                     fail!();
                     continue;
                 }
@@ -809,56 +916,52 @@ fn parse_module<State>(
                     Vec::with_capacity(len)
                 };
 
-                match name.as_str() {
-                    "hide" => module_items.push(Item::Hide(target_items)),
-                    "show" => module_items.push(Item::Show(target_items)),
+                match kind {
+                    FunctionKind::Hide => module_items.push(Item::Hide(target_items)),
+                    FunctionKind::Show => module_items.push(Item::Show(target_items)),
                     _ => unreachable!(),
                 }
             }
             // TokenKind::Function { name, args } if name == "def" => {
             // }
             // Custom function
-            TokenKind::Function { name, args } => {
-                let (is_comptime_call, fn_name) = name
-                    .strip_prefix('!')
-                    .map_or((false, name.as_str()), |rest| (true, rest));
+            TokenKind::Function {
+                kind: FunctionKind::Custom(fn_name),
+                args,
+                is_comptime,
+            } => {
+                let func = (token_loc, fn_name);
 
-                if !func_signature_is_valid((&token_loc, fn_name), &args, &[]) {
+                if !func_signature_is_valid(&module_name, std::iter::once(&func).chain(&args), &[])
+                {
                     fail!();
-                    continue;
                 }
 
-                let Some(func) = funcs_map.get(fn_name).copied() else {
-                    // TODO: lame + we need to validate that user didn't define a custom func with the name of builtin func
-                    if is_comptime_call {
-                        fail!(
-                            "{module_name}:{token_loc} either function `{fn_name}` is undefined or you trying to call builting function with `!` compile time preffix, which is not allowed"
-                        );
-                    } else {
-                        fail!("{module_name}:{token_loc} function `{fn_name}` is undefined");
-                    }
+                let Some(func) = funcs_map.get(func.1.as_str()).copied() else {
+                    fail!(
+                        "{module_name}:{token_loc} function `{}` is undefined",
+                        func.1
+                    );
                     continue;
                 };
 
                 let args = args.into_iter().map(|(_, a)| a).collect::<Vec<String>>();
 
-                if is_comptime_call {
+                let func_data = FuncData { is_comptime, args };
+
+                if is_comptime {
                     if label_to_assign.is_some() {
                         fail!(
                             "{module_name}:{token_loc} you cannot assign label for compile time function, it will not be present at runtime, bruh, obviously",
                         );
-                        continue;
                     }
 
-                    (funcs[func])(state, &args);
-                    continue;
+                    (funcs[func])(state, &func_data);
                 }
 
-                register_state_item!(true, Item::FunctionCall { func, args })
+                register_state_item!(true, Item::FunctionCall { func, func_data })
             }
         }
-
-        prev_token_loc = token_loc;
     }
 
     let module_links = link_state_items(
@@ -907,10 +1010,10 @@ impl Phrase {
         for part in parts {
             match part {
                 PhraseParts::Static(t) => buffer.push_str(t),
-                PhraseParts::FromFunction { func, args } => {
+                PhraseParts::FromFunction { func, func_data } => {
                     use std::fmt::Write;
 
-                    let _ = match (funcs[*func])(state, args) {
+                    let _ = match (funcs[*func])(state, func_data) {
                         ReturnValue::String(t) => write!(buffer, "{t}"),
                         ReturnValue::Bool(b) => write!(buffer, "{b}"),
                         ReturnValue::None => unreachable!(),
@@ -924,10 +1027,11 @@ impl Phrase {
 #[derive(Debug)]
 pub(crate) enum PhraseParts {
     Static(String),
-    FromFunction { func: usize, args: Vec<String> },
+    FromFunction { func: usize, func_data: FuncData },
 }
 
 fn parse_phrase<State>(
+    module_name: &str,
     mut phrase_loc: Loc,
     input: &str,
     funcs_map: &HashMap<&'static str, usize>,
@@ -968,16 +1072,23 @@ fn parse_phrase<State>(
 
     let mut failed = false;
     let mut parts = Vec::<PhraseParts>::new();
-    let mut stream = input.chars().map(|ch| {
-        let t = (phrase_loc, ch);
-        if ch == '\n' {
-            phrase_loc.line += 1;
-            phrase_loc.col = 1;
-        } else {
-            phrase_loc.col += 1;
-        }
+    let mut stream = input.lines().flat_map(|line| {
+        let mut loc = phrase_loc;
+        let chs = line
+            .chars()
+            .map(move |ch| {
+                let t = (loc, ch);
+                loc.col += 1;
+                t
+            })
+            .skip_while(|(_, ch)| ch.is_whitespace())
+            // put newline back, last one will be trimmed later
+            .chain(std::iter::once((loc, '\n')));
 
-        t
+        phrase_loc.line += 1;
+        phrase_loc.col = 1;
+
+        chs
     });
 
     let mut buf = String::new();
@@ -1019,17 +1130,23 @@ fn parse_phrase<State>(
 
         let func_loc = *func_loc;
 
-        let (is_comptime_call, fn_name) = name
+        let (is_comptime, fn_name) = name
             .strip_prefix('!')
             .map_or((false, name.as_str()), |rest| (true, rest));
 
-        let Some(func) = funcs_map.get(fn_name).copied() else {
+        let FunctionKind::Custom(fn_name) = FunctionKind::from_str(fn_name) else {
+            eprintln!("{func_loc} builtin function `{fn_name}` doesn't return string value");
+            failed = true;
+            continue;
+        };
+
+        let Some(func) = funcs_map.get(fn_name.as_str()).copied() else {
             eprintln!("{func_loc} function `{fn_name}` is undefined");
             failed = true;
             continue;
         };
 
-        if !func_signature_is_valid((&func_loc, fn_name), args, &[]) {
+        if !func_signature_is_valid(module_name, args, &[]) {
             failed = true;
             continue;
         }
@@ -1040,8 +1157,10 @@ fn parse_phrase<State>(
             .map(|(_, a)| a)
             .collect::<Vec<String>>();
 
-        if is_comptime_call {
-            let ReturnValue::String(output) = (funcs[func])(state, &args) else {
+        let func_data = FuncData { args, is_comptime };
+
+        if is_comptime {
+            let ReturnValue::String(output) = (funcs[func])(state, &func_data) else {
                 eprintln!("{func_loc} this function doesn't return a displayable value");
                 failed = true;
                 continue;
@@ -1053,13 +1172,16 @@ fn parse_phrase<State>(
                 parts.push(PhraseParts::Static(output));
             }
         } else {
-            if !matches!((funcs[func])(dummy_state, &args), ReturnValue::String(_)) {
+            if !matches!(
+                (funcs[func])(dummy_state, &func_data),
+                ReturnValue::String(_)
+            ) {
                 eprintln!("{func_loc} function doesn't return a displayable value");
                 failed = true;
                 continue;
             };
 
-            parts.push(PhraseParts::FromFunction { func, args });
+            parts.push(PhraseParts::FromFunction { func, func_data });
         }
     }
 
@@ -1071,9 +1193,13 @@ fn parse_phrase<State>(
         return Err(());
     }
 
+    if let Some(PhraseParts::Static(phrase)) = parts.last_mut() {
+        crate::utils::trim_end(phrase);
+    }
+
     Ok(
         if parts.len() == 1
-            && let Some(PhraseParts::Static(phrase)) =
+            && let Some(PhraseParts::Static(mut phrase)) =
                 parts.pop_if(|p| matches!(p, PhraseParts::Static(_)))
         {
             Phrase::Static(phrase)
@@ -1089,13 +1215,14 @@ fn parse_phrase<State>(
 const RESTRICTED_CHARS: &[char] = &['!', '@', '-', '>', '.'];
 
 fn func_signature_is_valid<'s>(
-    func: (&'s Loc, &'s str),
-    args: &'s [(Loc, String)],
+    module_name: &'s str,
+    args: impl IntoIterator<Item = &'s (Loc, String)>,
     exceptions: &'s [char],
 ) -> bool {
     let mut valid = true;
-    let errors = std::iter::once(func)
-        .chain(args.iter().map(|(loc, arg)| (loc, arg.as_str())))
+    let errors = args
+        .into_iter()
+        .map(|(loc, arg)| (loc, arg.as_str()))
         .flat_map(|(&loc, word)| {
             word.chars().enumerate().filter_map(move |(ch_idx, ch)| {
                 (RESTRICTED_CHARS.contains(&ch) && !exceptions.contains(&ch)).then_some((
@@ -1110,8 +1237,7 @@ fn func_signature_is_valid<'s>(
 
     for (err_loc, err_char) in errors {
         eprintln!(
-            "{err_loc} unacceptable character in function signature `{f}`: '{err_char}'",
-            f = func.1,
+            "{module_name}:{err_loc} unacceptable character in function signature: '{err_char}'",
         );
         valid = false
     }
