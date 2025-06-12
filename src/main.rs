@@ -5,7 +5,16 @@ use lexer::{Func, FuncData, Item, Phrase, ReturnValue};
 use std::collections::HashMap;
 use std::path::Path;
 
+
+// TODO: how to treat this case:
+//      @{
+//              func "hello
+//              world"
+//      }
+//
+//      same rules as with PhraseContinuation? so remove only depth level and keep the rest? but it means i need to collect indentation of the interpolation block
 // TODO: need to do something with cases like this:
+//
 //
 //      @as start
 //      - start
@@ -145,25 +154,21 @@ impl<State: Clone> Conversation<State> {
                 _ if !self.vis[self.current] => self.current = self.links[self.current]?,
                 Item::Response { .. } => {
                     self.update_phrases_in_state();
-                    // println!("found next response");
                     return Some(());
                 }
                 Item::Show(items) => {
                     for item in items {
-                        //     println!("showing item {item}");
                         self.vis[*item] = true;
                     }
                     self.current = self.links[self.current]?;
                 }
                 Item::Hide(items) => {
                     for item in items {
-                        //     println!("hiding item {item}");
                         self.vis[*item] = false;
                     }
                     self.current = self.links[self.current]?;
                 }
                 Item::Jump(target) => {
-                    // println!("jumping to {target}");
                     self.current = *target;
                 }
                 Item::FunctionCall { func, func_data } => {
@@ -212,10 +217,6 @@ impl<State: Clone> Conversation<State> {
 fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
     use std::io::Write;
 
-    // for i in 0..conv.items.len() {
-    //     println!("{:?} -> {:?}", conv.items[i], conv.links[i]);
-    // }
-
     let out = &mut std::io::stdout();
     let mut input = String::new();
 
@@ -224,7 +225,6 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
     }
 
     loop {
-        // println!("{:#?}", conv.vis);
         let state = conv.current;
 
         write!(out, "- ")?;
@@ -328,15 +328,32 @@ const TEST_CONVO: &str = "
 ";
 
 const TEST_CONVO2: &str = "
-@
-- hello
+@ \"test suka\" \"@\"
+- hellosuka@{
+#
+#
+#
+#
+#
 
-            @{
-                test
 
-            }
 
-        world";
+
+
+
+                # asdlfkj # suka
+
+
+
+                \"test
+                    suka\" \"}\" # ya mat tvou ebal
+
+
+
+
+
+
+            }world";
 
 fn test(_: &mut usize, func: &FuncData) -> ReturnValue {
     if func.is_comptime {
@@ -347,8 +364,12 @@ fn test(_: &mut usize, func: &FuncData) -> ReturnValue {
 }
 
 fn main() {
-    let Ok(convo) =
-        Conversation::from_source(TEST_CONVO2, "main", [("test", test as _)].into(), 0usize)
+    let Ok(convo) = Conversation::from_source(
+        TEST_CONVO2,
+        "main",
+        [("test suka", test as _)].into(),
+        0usize,
+    )
     // Conversation::load("test2.mur", [("aboba", test as _)].into(), 0usize)
     else {
         return;

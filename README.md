@@ -62,7 +62,7 @@ Phrases support newlines: this is one phrase and one option, newlines will be in
   Gonna vomit too..
 ```
 
-Comments begin with `#` at the start of the line:
+Comments begin with `#`:
 ```
 - Wanna talk?   
 # > I am gay.
@@ -86,10 +86,10 @@ Here you can get a sense of the logic of state transitioning:
 
 ## Functions
 #### `@<func> [args ...]`
-Calls a custom function, Where `func` is not one of the built-ins. Your custom functions will be defined via `HashMap<&str, fn(&mut YourCustomState, &[String]) -> _` that you pass to the parser.
+Calls a custom function, Where `func` is not one of the built-ins. Your custom functions will be defined via hash map, that you pass to the parser.
 ```rust
-fn tell_a_joke(my_state: &mut MyState, args: &[String]) -> ReturnValue {
-    println!("I love you! Why can't you see that, {name}?!", name = args[0]);
+fn tell_a_joke(my_state: &mut MyState, d: FuncData) -> ReturnValue {
+    println!("I love you! Why can't you see that, {name}?!", name = d.args[0]);
     my_state.psychological -= 1;
 
     ReturnValue::None // or ().into(), doesn't matter in this case, because value will be dropped anyway
@@ -105,6 +105,10 @@ and then in *murmur* file:
 This function will be executed each time it appears, but if you want a function that is executed only once, use `@ !<func>` syntax:
 ```
 @ !tell_a_joke_to bitch # this will be executed once at compile time
+```
+Signatures that contains spaces must be enclosed in double quotes
+```
+@ !"weird ass function name" "weird ass argument" # '!' must be a separate token outside of the function name
 ```
 
 #### `@as <label name>`
@@ -181,7 +185,19 @@ Will disable/enable the specified items, causing them to be skipped. If no label
 #### String interpolation using `@{<func> [args ...]}`
 Used in options and responses. This works the same way as calling inline functions. For example, `@{ func }` is evaluated each time it occurs, whereas `@{ !func }` constructs a static string:
 ```
-- {!player_name}, you are @{random_insult}!
+- @{!player_name}, you are @{random_insult}!
+```
+
+Newlines and comments are allowed within interpolation:
+```
+# imagine that the result will just replace '@'
+- aboba @{
+    "weird ass func name" # function name
+    # args:
+    arg1 # 1
+    arg2 # 2
+    # creativity died for this commit
+} aboba
 ```
 
 - TODO: `@if <func>`, `@elif <func>` and `@else`, where `func` is your `fn(&mut YourCustomState) -> bool`.

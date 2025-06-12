@@ -59,9 +59,9 @@ impl Default for Indentation {
 }
 
 #[derive(Copy, Clone, Debug, Default)]
-struct Loc {
-    line: u32,
-    col: u32,
+pub struct Loc {
+    pub line: u32,
+    pub col: u32,
 }
 
 impl fmt::Display for Loc {
@@ -136,59 +136,130 @@ pub(super) struct Token {
     indentation: Indentation,
 }
 
-fn collect_word(
-    stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
-) -> Option<(Loc, String)> {
-    let mut word = String::new();
-    let mut word_loc = None;
+enum WordErr {
+    UnclosedQuotes,
+    EndOfStream,
+    ReachedDelimiter,
+}
 
-    while let Some((_, ch, _)) = stream.next_if(|(_, ch, _)| ch.is_whitespace()) {
+fn skip_comment_until(
+    end: char,
+    stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
+) -> Result<(), WordErr> {
+    while let Some((_, ch)) = stream.peek().copied() {
         if ch == '\n' {
-            return None;
+            return Ok(());
+        }
+
+        let _ = stream.next();
+
+        if ch == end {
+            return Err(WordErr::ReachedDelimiter);
         }
     }
 
-    while let Some((_, ch, loc)) = stream.next_if(|(_, ch, _)| !ch.is_whitespace()) {
-        if word_loc.is_none() {
-            word_loc = Some(loc);
+    Err(WordErr::EndOfStream)
+}
+
+fn skip_trash_until(
+    end: char,
+    stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
+) -> Result<(), WordErr> {
+    while let Some((_, ch)) = stream.peek().copied() {
+        if ch == end {
+            let _ = stream.next();
+            return Err(WordErr::ReachedDelimiter);
+        } else if ch == '#' {
+            skip_comment_until(end, stream)?;
+        } else if !ch.is_whitespace() {
+            return Ok(());
         }
 
+        let _ = stream.next();
+    }
+
+    Err(WordErr::EndOfStream)
+}
+
+fn collect_func_name_until(
+    end: char,
+    stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
+) -> Result<(Loc, bool, String), WordErr> {
+    skip_trash_until(end, stream)?;
+    let is_comptime = stream.next_if(|(_, ch)| *ch == '!').is_some();
+    collect_word_until(end, stream).map(|(l, n)| (l, is_comptime, n))
+}
+
+fn collect_word_until(
+    end: char,
+    stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
+) -> Result<(Loc, String), WordErr> {
+    skip_trash_until(end, stream)?;
+
+    let Some((word_loc, next_ch)) = stream.peek().copied() else {
+        return Err(WordErr::EndOfStream);
+    };
+
+    if let '"' = next_ch {
+        let mut closed = false;
+        let mut end_loc = word_loc;
+        let word: String = stream
+            .by_ref()
+            .skip(1)
+            .take_while(|(ch_loc, ch)| {
+                end_loc = *ch_loc;
+
+                let go_on = *ch != '"';
+                if !go_on {
+                    closed = true;
+                }
+
+                go_on
+            })
+            .map(|(_, ch)| ch)
+            .collect();
+
+        return if closed {
+            Ok((word_loc, word))
+        } else {
+            eprintln!("{end_loc} couldn't find closing '\"' for one at {word_loc}");
+            Err(WordErr::UnclosedQuotes)
+        };
+    }
+
+    let mut word = String::new();
+    while let Some((_, ch)) = stream.next_if(|(_, ch)| !ch.is_whitespace()) {
         word.push(ch);
     }
 
-    (!word.is_empty()).then(|| (word_loc.unwrap(), word))
+    if word.is_empty() {
+        Err(WordErr::EndOfStream)
+    } else {
+        Ok((word_loc, word))
+    }
 }
 
-fn collect_phrase<'s>(
-    src: &'s str,
-    stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
-) -> Option<(Loc, &'s str)> {
-    // while let Some((_, ch, loc)) = stream.next_if(|(_, ch, _)| ch.is_whitespace()) {
-    //     if ch == '\n' {
-    //         return Some((loc, "\n"));
-    //     }
-    // }
+fn collect_phrase(
+    stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
+) -> Option<(Loc, String)> {
+    let mut phrase = String::new();
+    let loc = stream.peek().copied().map(|(l, _)| l)?;
 
-    let (phrase_start, _, loc) = stream.peek().copied()?;
-    let mut phrase_end: usize = phrase_start;
-
-    // NOTE: End is not trimmed, because the phrases may be combined in the future: Response/Option + PhraseContinuation
-    //       So the result Option or Response in the state will most likely contains a newline, which will be removed on parsing stage
-    for (idx, ch, _) in stream {
-        phrase_end = idx;
+    for (_, ch) in stream {
+        // NOTE: End is not trimmed, because the phrases may be combined in the future: Response/Option + PhraseContinuation
+        //       So the result Option or Response in the state will most likely contains a newline, which will be removed on parsing stage
+        phrase.push(ch);
         if ch == '\n' {
             break;
         }
     }
 
-    src.get(phrase_start..=phrase_end).map(|s| (loc, s))
+    (!phrase.is_empty()).then_some((loc, phrase))
 }
 
-fn collect_indent(
-    stream: &mut Peekable<impl Iterator<Item = (usize, char, Loc)>>,
-) -> Option<Indentation> {
+fn collect_indent(stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>) -> Option<Indentation> {
     let mut amount = 0;
-    let (_, ch, _) = stream.peek().copied()?;
+    let (_, ch) = stream.peek().copied()?;
 
     let mut indent = match ch {
         ' ' => Indentation::Spaces(0),
@@ -211,9 +282,8 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
 
     let mut stream = src
         .chars()
-        .enumerate()
-        .map(|(idx, ch)| {
-            let it = (idx, ch, loc);
+        .map(|ch| {
+            let it = (loc, ch);
 
             if ch == '\n' {
                 loc.line += 1;
@@ -227,41 +297,41 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
         .skip_while(|t| t.1 == '\n') // trim start
         .peekable();
 
-    loop {
+    'parsing_lines: loop {
         // TODO: this is collecting indentation for the PhraseContinuation, which i need when pointing on errors within string interpolation...
         let Some(indentation) = collect_indent(&mut stream) else {
             break;
         };
 
-        let Some((_, ch, _)) = stream.next() else {
+        let Some((_, ch)) = stream.next() else {
             break;
         };
 
         let token = match ch {
             '#' => {
-                let _ = collect_phrase(src, &mut stream);
+                let _ = skip_comment_until('\n', &mut stream);
                 continue;
             }
-            '@' if stream.peek().is_some_and(|(_, next_ch, _)| *next_ch != '{') => {
-                let Some((fn_loc, name)) = collect_word(&mut stream) else {
+            '@' if stream.peek().is_some_and(|(_, next_ch)| *next_ch != '{') => {
+                let Ok((fn_loc, is_comptime, fn_name)) = collect_func_name_until('\n', &mut stream)
+                else {
+                    // TODO: maybe complain
                     continue;
                 };
-                let (is_comptime, fn_name) = name
-                    .strip_prefix('!')
-                    .map_or((false, name.as_str()), |rest| (true, rest));
 
-                let kind = FunctionKind::from_str(fn_name);
+                let kind = FunctionKind::from_str(&fn_name);
                 let mut args = Vec::<(Loc, String)>::new();
 
-                let mut collecting = true;
-                while let Some(arg) = collect_word(&mut stream) {
-                    if arg.1.starts_with("#") {
-                        collecting = false // but continue draining our stream
-                    }
+                loop {
+                    let arg = match collect_word_until('\n', &mut stream) {
+                        Ok(a) => a,
+                        Err(WordErr::EndOfStream | WordErr::ReachedDelimiter) => {
+                            break;
+                        }
+                        Err(WordErr::UnclosedQuotes) => continue 'parsing_lines,
+                    };
 
-                    if collecting {
-                        args.push(arg);
-                    }
+                    args.push(arg);
                 }
 
                 Some((
@@ -273,17 +343,19 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
                     },
                 ))
             }
-            '>' => collect_phrase(src, &mut stream)
-                .map(|(loc, phrase)| (loc, TokenKind::Option(phrase.into()))),
-            '-' => collect_phrase(src, &mut stream)
-                .map(|(loc, phrase)| (loc, TokenKind::Response(phrase.into()))),
-            _ => collect_phrase(src, &mut stream).map(|(loc, phrase)| {
+            '>' => {
+                collect_phrase(&mut stream).map(|(loc, phrase)| (loc, TokenKind::Option(phrase)))
+            }
+            '-' => {
+                collect_phrase(&mut stream).map(|(loc, phrase)| (loc, TokenKind::Response(phrase)))
+            }
+            _ => collect_phrase(&mut stream).map(|(loc, phrase)| {
                 let mut char_buf = [0u8; 4];
                 (
                     loc,
                     // putting indentation back, so later on string interpolation we could report correct location of an error
                     TokenKind::PhraseContinuation(
-                        indentation.as_string() + ch.encode_utf8(&mut char_buf) + phrase,
+                        indentation.as_string() + ch.encode_utf8(&mut char_buf) + &phrase,
                     ),
                 )
             }),
@@ -320,6 +392,7 @@ pub(super) enum Item {
 pub struct FuncData {
     pub is_comptime: bool,
     pub args: Vec<String>,
+    pub call_location: Loc,
 }
 
 pub enum ReturnValue {
@@ -502,7 +575,6 @@ fn parse_module<State>(
     };
 
     let make_label = |m: &str, l: &str| m.to_owned() + "." + l;
-    // println!("{module_name} {tokens:#?}");
 
     let mut get_depth = |indent: Indentation, loc: Loc| -> Result<u32, ()> {
         if single_indentation.is_empty() {
@@ -547,7 +619,7 @@ fn parse_module<State>(
 
         let Ok(token_depth) = get_depth(token.indentation, token_loc) else {
             fail!();
-            continue;
+            return;
         };
 
         macro_rules! collect_whole_phrase {
@@ -564,9 +636,7 @@ fn parse_module<State>(
                 }
 
                 if let Ok(parsed_phrase) = parse_phrase(
-                    &module_name,
-                    token_loc,
-                    &p,
+                    (token_loc, token_depth, &p),
                     funcs_map,
                     funcs,
                     state,
@@ -922,20 +992,12 @@ fn parse_module<State>(
                     _ => unreachable!(),
                 }
             }
-            // TokenKind::Function { name, args } if name == "def" => {
-            // }
-            // Custom function
             TokenKind::Function {
                 kind: FunctionKind::Custom(fn_name),
                 args,
                 is_comptime,
             } => {
                 let func = (token_loc, fn_name);
-
-                if !func_signature_is_valid(&module_name, std::iter::once(&func).chain(&args), &[])
-                {
-                    fail!();
-                }
 
                 let Some(func) = funcs_map.get(func.1.as_str()).copied() else {
                     fail!(
@@ -947,7 +1009,11 @@ fn parse_module<State>(
 
                 let args = args.into_iter().map(|(_, a)| a).collect::<Vec<String>>();
 
-                let func_data = FuncData { is_comptime, args };
+                let func_data = FuncData {
+                    is_comptime,
+                    args,
+                    call_location: token_loc,
+                };
 
                 if is_comptime {
                     if label_to_assign.is_some() {
@@ -1031,65 +1097,33 @@ pub(crate) enum PhraseParts {
 }
 
 fn parse_phrase<State>(
-    module_name: &str,
-    mut phrase_loc: Loc,
-    input: &str,
+    (mut phrase_loc, phrase_depth, input): (Loc, u32, &str),
     funcs_map: &HashMap<&'static str, usize>,
     funcs: &[Func<State>],
     state: &mut State,
     dummy_state: &mut State,
 ) -> Result<Phrase, ()> {
-    fn collect_func(stream: &mut impl Iterator<Item = (Loc, char)>) -> Option<Vec<(Loc, String)>> {
-        let mut buf = String::new();
-        let mut args = Vec::new();
-        let mut arg_loc = None::<Loc>;
-
-        for (loc, ch) in stream {
-            if ch == '}' {
-                if !buf.is_empty() {
-                    args.push((arg_loc.take().unwrap(), buf.clone()));
-                    buf.clear();
-                }
-                return Some(args);
-            }
-
-            if ch.is_whitespace() {
-                if !buf.is_empty() {
-                    args.push((arg_loc.take().unwrap(), buf.clone()));
-                    buf.clear();
-                }
-            } else {
-                if arg_loc.is_none() {
-                    arg_loc = Some(loc);
-                }
-
-                buf.push(ch);
-            }
-        }
-
-        None
-    }
-
     let mut failed = false;
     let mut parts = Vec::<PhraseParts>::new();
-    let mut stream = input.lines().flat_map(|line| {
-        let mut loc = phrase_loc;
-        let chs = line
-            .chars()
-            .map(move |ch| {
-                let t = (loc, ch);
-                loc.col += 1;
-                t
-            })
-            .skip_while(|(_, ch)| ch.is_whitespace())
-            // put newline back, last one will be trimmed later
-            .chain(std::iter::once((loc, '\n')));
+    let mut stream = input
+        .split_inclusive('\n')
+        .flat_map(|line| {
+            let mut loc = phrase_loc;
+            let chs = line
+                .chars()
+                .map(move |ch| {
+                    let t = (loc, ch);
+                    loc.col += 1;
+                    t
+                })
+                .skip(phrase_depth as _);
 
-        phrase_loc.line += 1;
-        phrase_loc.col = 1;
+            phrase_loc.line += 1;
+            phrase_loc.col = 1;
 
-        chs
-    });
+            chs
+        })
+        .peekable();
 
     let mut buf = String::new();
     while let Some((_, ch)) = stream.next() {
@@ -1117,24 +1151,30 @@ fn parse_phrase<State>(
             buf.clear()
         }
 
-        let Some(func_args) = collect_func(&mut stream) else {
-            eprintln!("{next_ch_loc} could not find '}}' delimiter");
-            return Err(());
+        let (func_loc, is_comptime, fn_name) = match collect_func_name_until('}', &mut stream) {
+            Ok(f) => f,
+            Err(WordErr::ReachedDelimiter | WordErr::EndOfStream) => {
+                eprintln!("{next_ch_loc} expected function name within `@{{}}`");
+                return Err(());
+            }
+            Err(WordErr::UnclosedQuotes) => return Err(()),
         };
 
-        let Some(((func_loc, name), args)) = func_args.split_first() else {
-            eprintln!("{next_ch_loc} expected function name within `@{{}}`");
-            failed = true;
-            continue;
-        };
+        let mut func_args = Vec::new();
 
-        let func_loc = *func_loc;
+        loop {
+            match collect_word_until('}', &mut stream) {
+                Ok(arg) => func_args.push(arg),
+                Err(WordErr::EndOfStream) => {
+                    eprintln!("{next_ch_loc} could not find '}}' closing delimiter");
+                    return Err(());
+                }
+                Err(WordErr::ReachedDelimiter) => break,
+                Err(WordErr::UnclosedQuotes) => return Err(()),
+            }
+        }
 
-        let (is_comptime, fn_name) = name
-            .strip_prefix('!')
-            .map_or((false, name.as_str()), |rest| (true, rest));
-
-        let FunctionKind::Custom(fn_name) = FunctionKind::from_str(fn_name) else {
+        let FunctionKind::Custom(fn_name) = FunctionKind::from_str(&fn_name) else {
             eprintln!("{func_loc} builtin function `{fn_name}` doesn't return string value");
             failed = true;
             continue;
@@ -1146,18 +1186,17 @@ fn parse_phrase<State>(
             continue;
         };
 
-        if !func_signature_is_valid(module_name, args, &[]) {
-            failed = true;
-            continue;
-        }
-
         let args = func_args
             .into_iter()
             .skip(1)
             .map(|(_, a)| a)
             .collect::<Vec<String>>();
 
-        let func_data = FuncData { args, is_comptime };
+        let func_data = FuncData {
+            args,
+            is_comptime,
+            call_location: func_loc,
+        };
 
         if is_comptime {
             let ReturnValue::String(output) = (funcs[func])(state, &func_data) else {
@@ -1199,7 +1238,7 @@ fn parse_phrase<State>(
 
     Ok(
         if parts.len() == 1
-            && let Some(PhraseParts::Static(mut phrase)) =
+            && let Some(PhraseParts::Static(phrase)) =
                 parts.pop_if(|p| matches!(p, PhraseParts::Static(_)))
         {
             Phrase::Static(phrase)
@@ -1214,6 +1253,9 @@ fn parse_phrase<State>(
 
 const RESTRICTED_CHARS: &[char] = &['!', '@', '-', '>', '.'];
 
+// TODO: this function could be removed
+//      only used for builtins
+//      make separate function to validate label aruments or whatever
 fn func_signature_is_valid<'s>(
     module_name: &'s str,
     args: impl IntoIterator<Item = &'s (Loc, String)>,
@@ -1275,25 +1317,9 @@ fn link_state_items(
         let this_state = states[i];
 
         let maybe_options = match &items[this_state] {
-            // If { .. } => {
-            //     // TODO:
-            //     let potential_link = states[i + 1..].iter().find_map(|&&s| {
-            //         if item_depth[s] < item_depth[this_state] || item_depth[s] > item_depth[this_state] {
-            //             return Some(Err(()));
-            //         }
-
-            //         (item_depth[i] == item_depth[this_state]).then_some(Ok(i))
-            //     });
-
-            //     match potential_link {
-            //         Some(Ok(item)) = links[this_state] = Some(itme),
-            //         Some(Err(())) | None => links[this_state] = None,
-            //     }
-            // }
             Item::Response { options, .. } => Some(options),
             Item::FunctionCall { .. } | Item::Jump(_) | Item::Hide(_) | Item::Show(_) => None,
             Item::Option { .. } => unreachable!(),
-            // _ => todo!(),
         };
 
         if links[this_state].is_some()
@@ -1333,7 +1359,6 @@ fn get_depth_from_indent(
     if let (Indentation::Spaces(_), Indentation::Tabs(_))
     | (Indentation::Tabs(_), Indentation::Spaces(_)) = (indentation, &single_indent)
     {
-        // TODO: errors
         eprintln!(
             "{loc} got {} instead of {}",
             indentation.as_str_name(),
@@ -1346,7 +1371,6 @@ fn get_depth_from_indent(
     let single_amount = single_indent.get_amount();
     let indent = single_indent.as_str_name();
 
-    // TODO: errors
     if got_amount % single_amount != 0 {
         eprintln!(
             "{loc} inconsistent amount of {indent}: expected {single_amount} as a single_indent, but got {got_amount} total"
