@@ -1,11 +1,13 @@
 mod lexer;
 mod utils;
 
-use lexer::{Func, FuncData, Item, Phrase, ReturnValue};
+use lexer::{FuncData, Function, Item, Phrase};
 use std::collections::HashMap;
 use std::path::Path;
 
-
+// TODO: when reporting errors use full path
+// TODO: checking return type on dummmy is bad idea because the function may return other types in some cases
+// TODO: escape `"` for quoted words
 // TODO: how to treat this case:
 //      @{
 //              func "hello
@@ -41,30 +43,71 @@ use std::path::Path;
 // TODO: write tests, please?
 // TODO: normal error messages
 
-#[derive(Debug)]
-pub struct Conversation<State> {
-    state: State,
-    funcs: Vec<Func<State>>,
-
-    vis: Vec<bool>,
-    items: Vec<Item>,
-    links: Vec<Option<usize>>,
-
-    current: usize,
-}
-
 // only to shut the linter, see no point in having error types anyway in our case
 pub enum Error {
     ReadingInputFile,
     ParsingSource,
 }
 
-impl<State: Clone> Conversation<State> {
-    pub fn load(
-        path: impl AsRef<Path>,
-        funcs_map: HashMap<&'static str, Func<State>>,
-        state: State,
-    ) -> Result<Self, Error> {
+pub struct Compiler<ExternalState> {
+    funcs_map: HashMap<&'static str, Function<ExternalState>>,
+    state: ExternalState,
+}
+
+impl<ExternalState> Compiler<ExternalState> {
+    pub fn new(state: ExternalState) -> Self {
+        Self {
+            state,
+            funcs_map: HashMap::new(),
+        }
+    }
+
+    pub fn register_function<T>(
+        mut self,
+        name: &'static str,
+        f: impl lexer::IntoFunction<T, ExternalState>,
+    ) -> Self {
+        self.funcs_map.insert(name, f.into_function());
+        self
+    }
+
+    pub fn compile_source(
+        mut self,
+        module_name: impl AsRef<str>,
+        source: impl AsRef<str>,
+    ) -> Result<Conversation<ExternalState>, Error> {
+        let tokens = lexer::tokenize(source.as_ref());
+        let Ok((items, links, funcs)) = lexer::parse_tokens_into_items(
+            module_name.as_ref(),
+            tokens,
+            self.funcs_map,
+            &mut self.state,
+        ) else {
+            return Err(Error::ParsingSource);
+        };
+
+        let (current, next) = if items.is_empty() {
+            (None, None)
+        } else {
+            (Some(0), links[0])
+        };
+
+        let mut it = Conversation {
+            state: self.state,
+            funcs,
+            vis: vec![true; items.len()],
+            current,
+            next,
+            items,
+            links,
+        };
+
+        it.next_state();
+
+        Ok(it)
+    }
+
+    pub fn compile(self, path: impl AsRef<Path>) -> Result<Conversation<ExternalState>, Error> {
         let path = path.as_ref();
         let file_name = path.file_name().unwrap().to_str().unwrap();
         let module_name = file_name.strip_suffix(".mur").unwrap_or(file_name);
@@ -73,48 +116,30 @@ impl<State: Clone> Conversation<State> {
             Error::ReadingInputFile
         })?;
 
-        Self::from_source(src, module_name, funcs_map, state)
+        self.compile_source(src, module_name)
     }
+}
 
-    pub fn from_source(
-        src: impl AsRef<str>,
-        module_name: &str,
-        funcs_map: HashMap<&'static str, Func<State>>,
-        mut state: State,
-    ) -> Result<Self, Error> {
-        let tokens = lexer::tokenize(src.as_ref());
-        let Ok((items, links, funcs)) =
-            lexer::parse_tokens_into_items(module_name, tokens, funcs_map, &mut state)
-        else {
-            return Err(Error::ParsingSource);
-        };
+pub struct State<'s> {
+    items: &'s [Item],
+    current: usize,
+}
 
-        let mut it = Self {
-            state,
-            funcs,
-            vis: vec![true; items.len()],
-            current: 0,
-            items,
-            links,
-        };
-
-        it.get_to_response();
-
-        Ok(it)
-    }
-
+impl<'s> State<'s> {
     pub fn response(&self) -> Option<&str> {
-        if let Item::Response { phrase, .. } = self.items.get(self.current)?
-            && !phrase.is_empty()
-        {
-            Some(phrase.as_str())
-        } else {
-            None
-        }
+        let Item::Response { phrase, .. } = &self.items[self.current] else {
+            unreachable!();
+        };
+
+        phrase.as_nonempty_str()
     }
 
     pub fn options(&self) -> impl Iterator<Item = &str> {
-        self.options_indices().map(|opt| {
+        let Item::Response { options, .. } = &self.items[self.current] else {
+            unreachable!();
+        };
+
+        options.iter().copied().map(|opt| {
             let Item::Option { phrase, .. } = &self.items[opt] else {
                 unreachable!();
             };
@@ -125,70 +150,110 @@ impl<State: Clone> Conversation<State> {
         })
     }
 
-    pub fn next_state(&mut self) -> Option<()> {
-        self.current = self.links.get(self.current).copied()??;
-        self.get_to_response()
+    fn option_indices(&self) -> impl Iterator<Item = usize> {
+        let Item::Response { options, .. } = &self.items[self.current] else {
+            unreachable!();
+        };
+
+        options.iter().copied()
     }
+}
 
-    pub fn next_state_from_option(&mut self, option_idx: usize) -> Option<()> {
-        let next = self.options_indices().nth(option_idx)?;
-        self.current = next;
-        self.next_state()?;
+pub struct Conversation<ExternalState> {
+    state: ExternalState,
+    funcs: Vec<Function<ExternalState>>,
 
-        Some(())
-    }
+    vis: Vec<bool>,
+    items: Vec<Item>,
+    links: Vec<Option<usize>>,
 
-    fn options_indices(&self) -> impl Iterator<Item = usize> {
-        match &self.items[self.current] {
-            Item::Response { options, .. } => options,
-            _ => unreachable!(),
-        }
-        .iter()
-        .filter(|&&opt| self.vis[opt])
-        .copied()
-    }
+    current: Option<usize>,
+    next: Option<usize>,
+}
 
-    fn get_to_response(&mut self) -> Option<()> {
-        loop {
-            match self.items.get(self.current)? {
-                _ if !self.vis[self.current] => self.current = self.links[self.current]?,
+impl<ExternalState> Conversation<ExternalState> {
+    pub fn next_state(&mut self) -> bool {
+        self.current = Some(loop {
+            let Some(current) = self.next else {
+                return false;
+            };
+
+            let Some(item) = self.items.get(current) else {
+                return false;
+            };
+
+            match item {
+                _ if !self.vis[current] => self.next = self.links[current],
+                Item::End => {
+                    self.next = None;
+                    return false;
+                }
                 Item::Response { .. } => {
-                    self.update_phrases_in_state();
-                    return Some(());
+                    self.update_phrases_in_state(current);
+                    self.next = self.links[current];
+                    break current;
                 }
                 Item::Show(items) => {
                     for item in items {
                         self.vis[*item] = true;
                     }
-                    self.current = self.links[self.current]?;
+                    self.next = self.links[current];
                 }
                 Item::Hide(items) => {
                     for item in items {
                         self.vis[*item] = false;
                     }
-                    self.current = self.links[self.current]?;
+                    self.next = self.links[current];
                 }
                 Item::Jump(target) => {
-                    self.current = *target;
+                    self.next = Some(*target);
                 }
                 Item::FunctionCall { func, func_data } => {
-                    (self.funcs[*func])(&mut self.state, func_data);
-                    self.current = self.links[self.current]?;
+                    self.funcs[*func].call_drop(&mut self.state, func_data);
+                    self.next = self.links[current];
                 }
                 Item::Option { .. } => unreachable!(),
             }
-        }
+        });
+
+        true
     }
 
-    fn update_phrases_in_state(&mut self) {
-        let Item::Response { phrase, .. } = &mut self.items[self.current] else {
+    fn next_state_from_option(&mut self, option_idx: usize) -> bool {
+        let Some(current) = self.current else {
+            return false;
+        };
+
+        let Item::Response { options, .. } = &self.items[current] else {
+            unreachable!();
+        };
+
+        // TODO: i am trying to avoid any runtime errors from murmur
+        //      what should i do here?
+        self.next = options
+            .iter()
+            .filter(|&&opt| self.vis[opt])
+            .nth(option_idx)
+            .copied();
+
+        self.next_state()
+    }
+
+    fn current_state<'s>(&'s self) -> Option<State<'s>> {
+        self.current.map(|current| State {
+            items: &self.items,
+            current,
+        })
+    }
+
+    fn update_phrases_in_state(&mut self, state: usize) {
+        let Item::Response { phrase, .. } = &mut self.items[state] else {
             unreachable!();
         };
 
         phrase.update(&self.funcs, &mut self.state);
 
-        let Some((left, right)) = self.items.split_at_mut_checked(self.current + 1) else {
-            // means there is no options
+        let Some((left, right)) = self.items.split_at_mut_checked(state + 1) else {
             return;
         };
 
@@ -196,7 +261,7 @@ impl<State: Clone> Conversation<State> {
             unreachable!();
         };
 
-        let offset = self.current + 1;
+        let offset = state + 1;
 
         for &option in options.iter() {
             let opt = option - offset;
@@ -220,27 +285,21 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
     let out = &mut std::io::stdout();
     let mut input = String::new();
 
-    if conv.items.is_empty() {
-        return Ok(());
-    }
-
-    loop {
-        let state = conv.current;
+    while let Some(state) = conv.current_state() {
+        let current = state.current;
 
         write!(out, "- ")?;
-        if let Some(phrase) = conv.response() {
+        if let Some(phrase) = state.response() {
             write!(out, "{phrase}")?;
         }
 
-        write!(out, " [{state} -> ")?;
-        match &conv.links[state] {
+        write!(out, " [{current} -> ")?;
+        match &conv.links[current] {
             Some(next) => writeln!(out, "{next}]")?,
             None => writeln!(out, "End]")?,
         }
 
-        let opt_indices = conv.options_indices();
-
-        for (i, (phrase, opt)) in conv.options().zip(opt_indices).enumerate() {
+        for (i, (phrase, opt)) in state.options().zip(state.option_indices()).enumerate() {
             write!(out, "({i}) > {phrase:?} [{opt} -> ")?;
             match &conv.links[opt] {
                 Some(next) => writeln!(out, "{next}]")?,
@@ -249,7 +308,8 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
         }
 
         out.flush()?;
-        let next = loop {
+
+        let continuing = loop {
             input.clear();
             std::io::stdin().read_line(&mut input)?;
             utils::trim(&mut input);
@@ -258,10 +318,10 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
                 break conv.next_state_from_option(opt_idx);
             } else if input.is_empty() {
                 break conv.next_state();
-            }
+            };
         };
 
-        if next.is_some() {
+        if continuing {
             writeln!(out)?;
         } else {
             break;
@@ -271,7 +331,6 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
     Ok(())
 }
 
-// TODO: tell when import is unused
 const TEST_CONVO: &str = "
 -       1 -> 16 @{
 
@@ -327,35 +386,17 @@ const TEST_CONVO: &str = "
 @ jump test.Test # 23 -> 24 which is in test.mur file
 ";
 
-const TEST_CONVO2: &str = "
-@ \"test suka\" \"@\"
-- hellosuka@{
-#
-#
-#
-#
-#
+const TEST_CONVO2: &str = r#"
+# @import
+# @end
+- I am tired to make something funny
+  \        < this shit is not trimmed after '\'
+  # Hello I am a comment in the middle of the phrase for some reason!!?!?
+  \    #   < look this is escaped and not treated as comment 0_0
+  And I am just a casual new line without indentation..
+"#;
 
-
-
-
-
-
-                # asdlfkj # suka
-
-
-
-                \"test
-                    suka\" \"}\" # ya mat tvou ebal
-
-
-
-
-
-
-            }world";
-
-fn test(_: &mut usize, func: &FuncData) -> ReturnValue {
+fn test(_: &mut usize, func: &FuncData) -> String {
     if func.is_comptime {
         println!("calling function once");
     }
@@ -364,13 +405,9 @@ fn test(_: &mut usize, func: &FuncData) -> ReturnValue {
 }
 
 fn main() {
-    let Ok(convo) = Conversation::from_source(
-        TEST_CONVO2,
-        "main",
-        [("test suka", test as _)].into(),
-        0usize,
-    )
-    // Conversation::load("test2.mur", [("aboba", test as _)].into(), 0usize)
+    let Ok(convo) = Compiler::new(0usize)
+        .register_function("test suka", test)
+        .compile_source("main", TEST_CONVO2)
     else {
         return;
     };

@@ -70,6 +70,15 @@ Comments begin with `#`:
 - Ok, it is fine, we can talk later.
 ```
 
+If you want to have indentation in your text, use `\` to denote start of a new line in the phrase:
+```
+- I am too tired to make something funny..
+  \        < this shit is not trimmed after '\'
+  # Hello, I am a comment in the middle of the phrase for some reason!!?!?
+  \    #   < look, this is escaped and not treated as a comment 0_0
+  And I am just a casual new line without indentation..
+```
+
 Here you can get a sense of the logic of state transitioning:
 ```
 - state 1 => state 2

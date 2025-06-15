@@ -122,6 +122,7 @@ macro_rules! funcs_registry {
 }
 
 funcs_registry!(
+    End = "end",
     As = "as",
     Jump = "jump",
     Hide = "hide",
@@ -147,15 +148,14 @@ fn skip_comment_until(
     stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
 ) -> Result<(), WordErr> {
     while let Some((_, ch)) = stream.peek().copied() {
-        if ch == '\n' {
+        if ch == end {
+            let _ = stream.next();
+            return Err(WordErr::ReachedDelimiter);
+        } else if ch == '\n' {
             return Ok(());
         }
 
         let _ = stream.next();
-
-        if ch == end {
-            return Err(WordErr::ReachedDelimiter);
-        }
     }
 
     Err(WordErr::EndOfStream)
@@ -203,24 +203,30 @@ fn collect_word_until(
     if let '"' = next_ch {
         let mut closed = false;
         let mut end_loc = word_loc;
-        let word: String = stream
-            .by_ref()
-            .skip(1)
-            .take_while(|(ch_loc, ch)| {
-                end_loc = *ch_loc;
 
-                let go_on = *ch != '"';
-                if !go_on {
-                    closed = true;
-                }
+        let mut chars = stream.by_ref().skip(1).take_while(|(ch_loc, ch)| {
+            end_loc = *ch_loc;
 
-                go_on
+            let go_on = *ch != '"';
+            if !go_on {
+                closed = true;
+            }
+
+            go_on
+        });
+
+        let word = chars
+            .next()
+            .map(|(loc, ch)| {
+                // waiting for collect_into method 0_o
+                let mut word = ch.to_string();
+                word.extend(chars.map(|(_, ch)| ch));
+                (loc, word)
             })
-            .map(|(_, ch)| ch)
-            .collect();
+            .unwrap_or((word_loc, String::new()));
 
         return if closed {
-            Ok((word_loc, word))
+            Ok(word)
         } else {
             eprintln!("{end_loc} couldn't find closing '\"' for one at {word_loc}");
             Err(WordErr::UnclosedQuotes)
@@ -315,7 +321,7 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
             '@' if stream.peek().is_some_and(|(_, next_ch)| *next_ch != '{') => {
                 let Ok((fn_loc, is_comptime, fn_name)) = collect_func_name_until('\n', &mut stream)
                 else {
-                    // TODO: maybe complain
+                    // TODO: maybe complain?
                     continue;
                 };
 
@@ -383,6 +389,7 @@ pub(super) enum Item {
     Hide(Vec<usize>),
     Show(Vec<usize>),
     FunctionCall { func: usize, func_data: FuncData },
+    End,
     // If { condition_fn: usize },
     // Elif { condition_fn: usize },
     // Else { condition_fn: usize },
@@ -395,47 +402,60 @@ pub struct FuncData {
     pub call_location: Loc,
 }
 
-pub enum ReturnValue {
-    Bool(bool),
-    String(String),
-    None,
+pub(super) type Func<State, Ret> = dyn Fn(&mut State, &FuncData) -> Ret;
+
+pub enum Function<State> {
+    Bool(Box<Func<State, bool>>),
+    String(Box<Func<State, String>>),
+    Nothing(Box<Func<State, ()>>),
 }
 
-impl From<bool> for ReturnValue {
-    fn from(this: bool) -> Self {
-        ReturnValue::Bool(this)
-    }
-}
-
-impl From<String> for ReturnValue {
-    fn from(this: String) -> Self {
-        ReturnValue::String(this)
-    }
-}
-
-impl From<&str> for ReturnValue {
-    fn from(this: &str) -> Self {
-        ReturnValue::String(this.to_owned())
-    }
-}
-
-impl From<()> for ReturnValue {
-    fn from(_: ()) -> Self {
-        ReturnValue::None
-    }
-}
-
-impl fmt::Display for ReturnValue {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl<State> Function<State> {
+    pub(super) fn call_drop(&self, state: &mut State, func_data: &FuncData) {
         match self {
-            ReturnValue::String(s) => write!(f, "{s}"),
-            ReturnValue::Bool(b) => write!(f, "{b}"),
-            ReturnValue::None => Err(fmt::Error),
+            Function::String(f) => {
+                f(state, func_data);
+            }
+            Function::Bool(f) => {
+                f(state, func_data);
+            }
+            Function::Nothing(f) => {
+                f(state, func_data);
+            }
         }
     }
 }
 
-pub(super) type Func<State> = fn(&mut State, &FuncData) -> ReturnValue;
+// generic is a trick to avoid trait collision because rust is safe and blazingly fast..
+pub trait IntoFunction<T, State> {
+    fn into_function(self) -> Function<State>;
+}
+
+impl<State, F> IntoFunction<(), State> for F
+where
+    F: Fn(&mut State, &FuncData) + 'static,
+{
+    fn into_function(self) -> Function<State> {
+        Function::Nothing(Box::new(self))
+    }
+}
+impl<State, F> IntoFunction<String, State> for F
+where
+    F: Fn(&mut State, &FuncData) -> String + 'static,
+{
+    fn into_function(self) -> Function<State> {
+        Function::String(Box::new(self))
+    }
+}
+
+impl<State, F> IntoFunction<bool, State> for F
+where
+    F: Fn(&mut State, &FuncData) -> bool + 'static,
+{
+    fn into_function(self) -> Function<State> {
+        Function::Bool(Box::new(self))
+    }
+}
 
 #[derive(Default)]
 struct ParserData {
@@ -444,7 +464,7 @@ struct ParserData {
     label_jumps: HashMap<usize, (Loc, String)>, // to store all jumps, before all labels are defined
     label_vis_changes: HashMap<usize, Vec<(Loc, String)>>, // to store args for `hide` or `show` funcs, before all labels are defined
 
-    modules: HashMap<String, bool>, // keep track of what is already imported
+    modules: HashMap<String, bool>, // keep track of what is already loaded into queue
     local_imports: HashMap<String, HashMap<String, (Loc, bool)>>,
     load_queue: Vec<(String, Vec<Token>)>, // module name, tokens
 
@@ -455,15 +475,13 @@ struct ParserData {
 }
 
 #[allow(clippy::type_complexity)]
-pub(super) fn parse_tokens_into_items<State: Clone>(
+pub(super) fn parse_tokens_into_items<State>(
     main_module: &str,
     tokens: Vec<Token>,
-    funcs_map_defs: HashMap<&'static str, Func<State>>,
+    funcs_map_defs: HashMap<&'static str, Function<State>>,
     state: &mut State,
-) -> Result<(Vec<Item>, Vec<Option<usize>>, Vec<Func<State>>), ()> {
+) -> Result<(Vec<Item>, Vec<Option<usize>>, Vec<Function<State>>), ()> {
     let mut parser = ParserData::default();
-    let mut dummy_state = state.clone();
-
     let mut funcs = Vec::new();
     let mut funcs_map = HashMap::new();
 
@@ -477,7 +495,7 @@ pub(super) fn parse_tokens_into_items<State: Clone>(
     parser.load_queue.push((main_module.into(), tokens));
 
     while !parser.load_queue.is_empty() {
-        parse_module(&mut parser, &funcs_map, &funcs, state, &mut dummy_state);
+        parse_module(&mut parser, &funcs_map, &funcs, state);
     }
 
     for (module, imports) in parser.local_imports {
@@ -492,7 +510,6 @@ pub(super) fn parse_tokens_into_items<State: Clone>(
     // panic!("{:#?}", parser.labels_map);
 
     for (jump_item, (loc, label)) in parser.label_jumps {
-        // TODO: store location
         let Some(target_item) = parser.labels_map.get(&label).copied() else {
             eprintln!("{loc} label doesn't exist: {label}");
             parser.failed = true;
@@ -555,9 +572,8 @@ fn parse_module<State>(
         failed,
     }: &mut ParserData,
     funcs_map: &HashMap<&'static str, usize>,
-    funcs: &[Func<State>],
+    funcs: &[Function<State>],
     state: &mut State,
-    dummy_state: &mut State,
 ) {
     macro_rules! fail {
         () => {{
@@ -635,13 +651,7 @@ fn parse_module<State>(
                     let _ = tokens.next();
                 }
 
-                if let Ok(parsed_phrase) = parse_phrase(
-                    (token_loc, token_depth, &p),
-                    funcs_map,
-                    funcs,
-                    state,
-                    dummy_state,
-                ) {
+                if let Ok(parsed_phrase) = parse_phrase((token_loc, &p), funcs_map, funcs, state) {
                     parsed_phrase
                 } else {
                     fail!();
@@ -704,8 +714,6 @@ fn parse_module<State>(
                     }
                 }
 
-                // TODO: i thought that i could just push locala imports but at this point not all of the imports availabel
-                //          because @import may be located later in the file (after the block), which is not a big deal?
                 load_queue.push((module_name.clone(), block));
 
                 continue;
@@ -852,6 +860,26 @@ fn parse_module<State>(
                 register_state_item!(true, Item::Jump(0));
             }
             TokenKind::Function {
+                kind: kind @ FunctionKind::End,
+                is_comptime,
+                args,
+            } => {
+                if is_comptime {
+                    fail!(
+                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
+                    )
+                }
+
+                if !args.is_empty() {
+                    let (loc, _) = args[1];
+                    fail!(
+                        "{module_name}:{loc} too many arguments for `{kind}` function, expected only one label"
+                    );
+                }
+
+                register_state_item!(true, Item::End);
+            }
+            TokenKind::Function {
                 kind: kind @ FunctionKind::As,
                 is_comptime,
                 mut args,
@@ -865,7 +893,7 @@ fn parse_module<State>(
                 if args.len() > 1 {
                     let (loc, _) = args[1];
                     fail!(
-                        "{module_name}:{loc} too many arguments for `as` function, expected only one label"
+                        "{module_name}:{loc} too many arguments for `{kind}` function, expected only one label"
                     );
                 }
 
@@ -928,7 +956,7 @@ fn parse_module<State>(
                 };
 
                 if module == module_name {
-                    fail!("{:?} self import is weird", module_name_loc);
+                    fail!("{module_name}:{module_name_loc} self import is weird");
                     continue;
                 }
                 if !modules.contains_key(&module) {
@@ -938,8 +966,7 @@ fn parse_module<State>(
                 if let Some(imps) = local_imports.get_mut(&module_name) {
                     if let Some((prev_loc, m)) = imps.insert(module, (module_name_loc, false)) {
                         fail!(
-                            "{:?} duplicate import `{m}`, previous import at {prev_loc}",
-                            module_name_loc
+                            "{module_name}:{module_name_loc} duplicate import `{m}`, previous import at {prev_loc}",
                         );
                     }
                 } else {
@@ -1014,7 +1041,6 @@ fn parse_module<State>(
                     args,
                     call_location: token_loc,
                 };
-
                 if is_comptime {
                     if label_to_assign.is_some() {
                         fail!(
@@ -1022,7 +1048,7 @@ fn parse_module<State>(
                         );
                     }
 
-                    (funcs[func])(state, &func_data);
+                    funcs[func].call_drop(state, &func_data);
                 }
 
                 register_state_item!(true, Item::FunctionCall { func, func_data })
@@ -1059,14 +1085,12 @@ impl Phrase {
         }
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        match self {
-            Phrase::Static(t) => t.is_empty(),
-            Phrase::Dynamic { buffer, .. } => buffer.is_empty(),
-        }
+    pub(super) fn as_nonempty_str(&self) -> Option<&str> {
+        let s = self.as_str();
+        (!s.is_empty()).then_some(s)
     }
 
-    pub(super) fn update<State>(&mut self, funcs: &[Func<State>], state: &mut State) {
+    pub(super) fn update<State>(&mut self, funcs: &[Function<State>], state: &mut State) {
         let Phrase::Dynamic { buffer, parts } = self else {
             return;
         };
@@ -1079,11 +1103,11 @@ impl Phrase {
                 PhraseParts::FromFunction { func, func_data } => {
                     use std::fmt::Write;
 
-                    let _ = match (funcs[*func])(state, func_data) {
-                        ReturnValue::String(t) => write!(buffer, "{t}"),
-                        ReturnValue::Bool(b) => write!(buffer, "{b}"),
-                        ReturnValue::None => unreachable!(),
+                    let Function::String(f) = &funcs[*func] else {
+                        unreachable!();
                     };
+
+                    let _ = write!(buffer, "{}", f(state, func_data));
                 }
             }
         }
@@ -1097,11 +1121,10 @@ pub(crate) enum PhraseParts {
 }
 
 fn parse_phrase<State>(
-    (mut phrase_loc, phrase_depth, input): (Loc, u32, &str),
+    (mut phrase_loc, input): (Loc, &str),
     funcs_map: &HashMap<&'static str, usize>,
-    funcs: &[Func<State>],
+    funcs: &[Function<State>],
     state: &mut State,
-    dummy_state: &mut State,
 ) -> Result<Phrase, ()> {
     let mut failed = false;
     let mut parts = Vec::<PhraseParts>::new();
@@ -1116,7 +1139,8 @@ fn parse_phrase<State>(
                     loc.col += 1;
                     t
                 })
-                .skip(phrase_depth as _);
+                .skip_while(|(_, ch)| *ch != '\n' && ch.is_whitespace())
+                .skip_while(|(_, ch)| *ch == '\\');
 
             phrase_loc.line += 1;
             phrase_loc.col = 1;
@@ -1199,11 +1223,14 @@ fn parse_phrase<State>(
         };
 
         if is_comptime {
-            let ReturnValue::String(output) = (funcs[func])(state, &func_data) else {
+            let Function::String(f) = &funcs[func] else {
                 eprintln!("{func_loc} this function doesn't return a displayable value");
                 failed = true;
                 continue;
             };
+
+            let output = f(state, &func_data);
+
             if let Some(PhraseParts::Static(ph)) = parts.last_mut() {
                 ph.push_str(&output);
                 continue;
@@ -1211,10 +1238,7 @@ fn parse_phrase<State>(
                 parts.push(PhraseParts::Static(output));
             }
         } else {
-            if !matches!(
-                (funcs[func])(dummy_state, &func_data),
-                ReturnValue::String(_)
-            ) {
+            if !matches!(funcs[func], Function::String(_)) {
                 eprintln!("{func_loc} function doesn't return a displayable value");
                 failed = true;
                 continue;
@@ -1299,13 +1323,15 @@ fn link_state_items(
 
     for (item, kind) in items.iter().enumerate() {
         // filter out options,
-        if let Item::Option { .. } = kind {
+        if let Item::Option { .. } | Item::End = kind {
             continue;
         }
 
         // link previous item with this state item
-        if let Some(prev_item_link @ None) =
-            item.checked_sub(1).map(|prev_item| &mut links[prev_item])
+        if let Some(prev_item_link @ None) = item
+            .checked_sub(1)
+            .filter(|prev_item| !matches!(items[*prev_item], Item::End))
+            .map(|prev_item| &mut links[prev_item])
         {
             *prev_item_link = Some(item + link_offset);
         }
@@ -1319,7 +1345,7 @@ fn link_state_items(
         let maybe_options = match &items[this_state] {
             Item::Response { options, .. } => Some(options),
             Item::FunctionCall { .. } | Item::Jump(_) | Item::Hide(_) | Item::Show(_) => None,
-            Item::Option { .. } => unreachable!(),
+            Item::End | Item::Option { .. } => unreachable!(),
         };
 
         if links[this_state].is_some()
