@@ -39,7 +39,6 @@ use std::path::Path;
 //      - aboba
 //      > $opt
 // TODO: @if @elif @else
-//      idea: to validate that the function returns a bool we can execute it on a dummy (cloned) state and get the return value
 // TODO: write tests, please?
 // TODO: normal error messages
 
@@ -71,7 +70,7 @@ impl<ExternalState> Compiler<ExternalState> {
         self
     }
 
-    pub fn compile_source(
+    pub fn compile_source_as(
         mut self,
         module_name: impl AsRef<str>,
         source: impl AsRef<str>,
@@ -116,7 +115,7 @@ impl<ExternalState> Compiler<ExternalState> {
             Error::ReadingInputFile
         })?;
 
-        self.compile_source(src, module_name)
+        self.compile_source_as(src, module_name)
     }
 }
 
@@ -234,7 +233,8 @@ impl<ExternalState> Conversation<ExternalState> {
             .iter()
             .filter(|&&opt| self.vis[opt])
             .nth(option_idx)
-            .copied();
+            .and_then(|&opt| self.links[opt]);
+
 
         self.next_state()
     }
@@ -312,7 +312,7 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
         let continuing = loop {
             input.clear();
             std::io::stdin().read_line(&mut input)?;
-            utils::trim(&mut input);
+            let input = input.trim();
 
             if let Ok(opt_idx) = input.parse::<usize>() {
                 break conv.next_state_from_option(opt_idx);
@@ -321,9 +321,7 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
             };
         };
 
-        if continuing {
-            writeln!(out)?;
-        } else {
+        if !continuing {
             break;
         }
     }
@@ -386,17 +384,17 @@ const TEST_CONVO: &str = "
 @ jump test.Test # 23 -> 24 which is in test.mur file
 ";
 
-// const TEST_CONVO2: &str = r#"
-// - I am tired to make something funny
-//   \        < this shit is not trimmed after '\'
-//   # Hello I am a comment in the middle of the phrase for some reason!!?!?
-//   \    #   < look this is escaped and not treated as comment 0_0
-//   And I am just a casual new line without indentation..
-
-
 const TEST_CONVO2: &str = r#"
+- I am tired to make something funny
+  \        < this shit is not trimmed after '\'
+  # Hello I am a comment in the middle of the phrase for some reason!!?!?
+  \    #   < look this is escaped and not treated as comment 0_0
+  And I am just a casual new line without indentation..
 - suka
-@ "print hello" "#;
+> one
+    @ aboba
+> two
+- @ "print hello" "#;
 
 fn test(_: &mut usize, func: &FuncData) -> String {
     if func.is_comptime {
@@ -412,10 +410,13 @@ fn main() {
         .register_function("print hello", |_: &mut usize, d: &FuncData| {
             println!("hello {}", d.is_comptime)
         })
-        .compile_source("main", TEST_CONVO2)
+        .register_function("aboba", |_: &mut usize, d: &FuncData| {
+            println!("aboba {}", d.is_comptime)
+        })
+        .compile_source_as("main", TEST_CONVO2)
     else {
         return;
     };
-
+    println!("{:#?}", convo.links);
     run(convo).unwrap();
 }

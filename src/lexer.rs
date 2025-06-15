@@ -442,6 +442,16 @@ impl<State> Function<State> {
 pub trait IntoFunction<T, State> {
     fn into_function(self) -> Function<State>;
 }
+// TODO:
+// impl<State, F> IntoFunction<String, State> for F
+// where
+//     F: Fn(&State, &FuncData) -> String + 'static,
+// {
+//     fn into_function(self) -> Function<State> {
+//         // Automatically box the String return type as Box<dyn Display>
+//         Function::Display(Box::new(move |state, func_data| Box::new(self(state, func_data)) as Box<dyn Display>))
+//     }
+// }
 
 impl<State, F> IntoFunction<(), State> for F
 where
