@@ -355,6 +355,18 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
             '-' => {
                 collect_phrase(&mut stream).map(|(loc, phrase)| (loc, TokenKind::Response(phrase)))
             }
+            '\n' => {
+                if let Some(Token {
+                    kind: TokenKind::Option(p) | TokenKind::Response(p) | TokenKind::PhraseContinuation(p),
+                    ..
+                }) = tokens.last_mut()
+                {
+                    p.push(ch);
+                }
+
+                continue;
+            }
+            // TODO: i could push a phrase part into the last token?
             _ => collect_phrase(&mut stream).map(|(loc, phrase)| {
                 let mut char_buf = [0u8; 4];
                 (
@@ -1041,6 +1053,7 @@ fn parse_module<State>(
                     args,
                     call_location: token_loc,
                 };
+
                 if is_comptime {
                     if label_to_assign.is_some() {
                         fail!(
@@ -1199,7 +1212,7 @@ fn parse_phrase<State>(
         }
 
         let FunctionKind::Custom(fn_name) = FunctionKind::from_str(&fn_name) else {
-            eprintln!("{func_loc} builtin function `{fn_name}` doesn't return string value");
+            eprintln!("{func_loc} builtin function `{fn_name}` doesn't return displayable value");
             failed = true;
             continue;
         };

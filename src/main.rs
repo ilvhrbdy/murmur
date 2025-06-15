@@ -89,7 +89,7 @@ impl<ExternalState> Compiler<ExternalState> {
         let (current, next) = if items.is_empty() {
             (None, None)
         } else {
-            (Some(0), links[0])
+            (Some(0), Some(0))
         };
 
         let mut it = Conversation {
@@ -386,15 +386,17 @@ const TEST_CONVO: &str = "
 @ jump test.Test # 23 -> 24 which is in test.mur file
 ";
 
+// const TEST_CONVO2: &str = r#"
+// - I am tired to make something funny
+//   \        < this shit is not trimmed after '\'
+//   # Hello I am a comment in the middle of the phrase for some reason!!?!?
+//   \    #   < look this is escaped and not treated as comment 0_0
+//   And I am just a casual new line without indentation..
+
+
 const TEST_CONVO2: &str = r#"
-# @import
-# @end
-- I am tired to make something funny
-  \        < this shit is not trimmed after '\'
-  # Hello I am a comment in the middle of the phrase for some reason!!?!?
-  \    #   < look this is escaped and not treated as comment 0_0
-  And I am just a casual new line without indentation..
-"#;
+- suka
+@ "print hello" "#;
 
 fn test(_: &mut usize, func: &FuncData) -> String {
     if func.is_comptime {
@@ -407,6 +409,9 @@ fn test(_: &mut usize, func: &FuncData) -> String {
 fn main() {
     let Ok(convo) = Compiler::new(0usize)
         .register_function("test suka", test)
+        .register_function("print hello", |_: &mut usize, d: &FuncData| {
+            println!("hello {}", d.is_comptime)
+        })
         .compile_source("main", TEST_CONVO2)
     else {
         return;
