@@ -75,10 +75,10 @@ enum TokenKind {
     Function {
         kind: FunctionKind,
         args: Vec<(Loc, String)>,
-        is_comptime: bool,
+        once: bool,
     },
     Response(String),           // `-` - npc's response phrase in conversation
-    Option(String),             // `>` - player's option in conversation
+    Choice(String),             // `>` - player's option in conversation
     PhraseContinuation(String), // phrases on newlines excluding indentation
     IsolatedBlock(String),      // constructed on parsing stage
 }
@@ -128,6 +128,7 @@ funcs_registry!(
     Hide = "hide",
     Show = "show",
     Import = "import",
+    If = "if",
 );
 
 #[derive(Debug)]
@@ -143,22 +144,17 @@ enum WordErr {
     ReachedDelimiter,
 }
 
-fn skip_comment_until(
-    end: char,
-    stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
-) -> Result<(), WordErr> {
+fn skip_comment_until(end: char, stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>) {
     while let Some((_, ch)) = stream.peek().copied() {
         if ch == end {
             let _ = stream.next();
-            return Err(WordErr::ReachedDelimiter);
+            break;
         } else if ch == '\n' {
-            return Ok(());
+            break;
         }
 
         let _ = stream.next();
     }
-
-    Err(WordErr::EndOfStream)
 }
 
 fn skip_trash_until(
@@ -170,7 +166,7 @@ fn skip_trash_until(
             let _ = stream.next();
             return Err(WordErr::ReachedDelimiter);
         } else if ch == '#' {
-            skip_comment_until(end, stream)?;
+            skip_comment_until(end, stream);
         } else if !ch.is_whitespace() {
             return Ok(());
         }
@@ -181,13 +177,30 @@ fn skip_trash_until(
     Err(WordErr::EndOfStream)
 }
 
-fn collect_func_name_until(
+#[allow(clippy::type_complexity)]
+fn collect_func_until(
     end: char,
     stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
-) -> Result<(Loc, bool, String), WordErr> {
+) -> Result<(Loc, bool, String, Vec<(Loc, String)>), WordErr> {
     skip_trash_until(end, stream)?;
-    let is_comptime = stream.next_if(|(_, ch)| *ch == '!').is_some();
-    collect_word_until(end, stream).map(|(l, n)| (l, is_comptime, n))
+
+    let once = stream.next_if(|(_, ch)| *ch == '!').is_some();
+    let (fn_loc, fn_name) = collect_word_until(end, stream)?;
+    let mut args = Vec::<(Loc, String)>::new();
+
+    loop {
+        let arg = match collect_word_until(end, stream) {
+            Ok(a) => a,
+            Err(WordErr::EndOfStream | WordErr::ReachedDelimiter) => {
+                break;
+            }
+            Err(err) => return Err(err),
+        };
+
+        args.push(arg);
+    }
+
+    Ok((fn_loc, once, fn_name, args))
 }
 
 fn collect_word_until(
@@ -235,7 +248,13 @@ fn collect_word_until(
 
     let mut word = String::new();
     while let Some((_, ch)) = stream.next_if(|(_, ch)| !ch.is_whitespace()) {
-        word.push(ch);
+        if ch == end {
+            break;
+        } else if ch == '#' {
+            skip_comment_until(end, stream);
+        } else {
+            word.push(ch);
+        }
     }
 
     if word.is_empty() {
@@ -303,7 +322,7 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
         .skip_while(|t| t.1 == '\n') // trim start
         .peekable();
 
-    'parsing_lines: loop {
+    loop {
         // TODO: this is collecting indentation for the PhraseContinuation, which i need when pointing on errors within string interpolation...
         let Some(indentation) = collect_indent(&mut stream) else {
             break;
@@ -314,50 +333,25 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
         };
 
         let token = match ch {
-            '#' => {
-                let _ = skip_comment_until('\n', &mut stream);
-                continue;
-            }
-            '@' if stream.peek().is_some_and(|(_, next_ch)| *next_ch != '{') => {
-                let Ok((fn_loc, is_comptime, fn_name)) = collect_func_name_until('\n', &mut stream)
+            '#' if stream.peek().is_some_and(|(_, next_ch)| *next_ch != '{') => {
+                let Ok((fn_loc, once, fn_name, args)) = collect_func_until('\n', &mut stream)
                 else {
-                    // TODO: maybe complain?
                     continue;
                 };
 
                 let kind = FunctionKind::from_str(&fn_name);
-                let mut args = Vec::<(Loc, String)>::new();
-
-                loop {
-                    let arg = match collect_word_until('\n', &mut stream) {
-                        Ok(a) => a,
-                        Err(WordErr::EndOfStream | WordErr::ReachedDelimiter) => {
-                            break;
-                        }
-                        Err(WordErr::UnclosedQuotes) => continue 'parsing_lines,
-                    };
-
-                    args.push(arg);
-                }
-
-                Some((
-                    fn_loc,
-                    TokenKind::Function {
-                        kind,
-                        args,
-                        is_comptime,
-                    },
-                ))
+                Some((fn_loc, TokenKind::Function { kind, args, once }))
             }
             '>' => {
-                collect_phrase(&mut stream).map(|(loc, phrase)| (loc, TokenKind::Option(phrase)))
+                collect_phrase(&mut stream).map(|(loc, phrase)| (loc, TokenKind::Choice(phrase)))
             }
             '-' => {
                 collect_phrase(&mut stream).map(|(loc, phrase)| (loc, TokenKind::Response(phrase)))
             }
             '\n' => {
                 if let Some(Token {
-                    kind: TokenKind::Option(p) | TokenKind::Response(p) | TokenKind::PhraseContinuation(p),
+                    kind:
+                        TokenKind::Choice(p) | TokenKind::Response(p) | TokenKind::PhraseContinuation(p),
                     ..
                 }) = tokens.last_mut()
                 {
@@ -395,23 +389,49 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
 
 #[derive(Debug)]
 pub(super) enum Item {
-    Response { phrase: Phrase, options: Vec<usize> },
-    Option { phrase: Phrase },
-    Jump(usize),
-    Hide(Vec<usize>),
-    Show(Vec<usize>),
-    FunctionCall { func: usize, func_data: FuncData },
+    Nop,
     End,
-    // If { condition_fn: usize },
+    Response {
+        phrase: Phrase,
+        choices: Vec<usize>,
+    },
+    Choice {
+        conditions: Vec<usize>,
+        phrase: Phrase,
+        display: bool, // all conditions returned true
+    },
+    Jump {
+        once: bool,
+        target: usize,
+    },
+    Hide {
+        once: bool,
+        targets: Vec<usize>,
+    },
+    Show {
+        once: bool,
+        targets: Vec<usize>,
+    },
+    FunctionCall {
+        func_data: FuncData,
+        func: usize,
+    },
+    If {
+        func_data: FuncData,
+        func: usize,
+
+        next: Option<usize>,
+        holds_choices: bool,
+    },
     // Elif { condition_fn: usize },
     // Else { condition_fn: usize },
 }
 
 #[derive(Debug)]
 pub struct FuncData {
-    pub is_comptime: bool,
-    pub args: Vec<String>,
+    pub once: bool,
     pub call_location: Loc,
+    pub args: Vec<String>,
 }
 
 pub(super) type Func<State, Ret> = dyn Fn(&mut State, &FuncData) -> Ret;
@@ -439,21 +459,11 @@ impl<State> Function<State> {
 }
 
 // generic is a trick to avoid trait collision because rust is safe and blazingly fast..
-pub trait IntoFunction<T, State> {
+pub trait IntoFunction<State, T> {
     fn into_function(self) -> Function<State>;
 }
-// TODO:
-// impl<State, F> IntoFunction<String, State> for F
-// where
-//     F: Fn(&State, &FuncData) -> String + 'static,
-// {
-//     fn into_function(self) -> Function<State> {
-//         // Automatically box the String return type as Box<dyn Display>
-//         Function::Display(Box::new(move |state, func_data| Box::new(self(state, func_data)) as Box<dyn Display>))
-//     }
-// }
 
-impl<State, F> IntoFunction<(), State> for F
+impl<State, F> IntoFunction<State, ()> for F
 where
     F: Fn(&mut State, &FuncData) + 'static,
 {
@@ -461,7 +471,7 @@ where
         Function::Nothing(Box::new(self))
     }
 }
-impl<State, F> IntoFunction<String, State> for F
+impl<State, F> IntoFunction<State, String> for F
 where
     F: Fn(&mut State, &FuncData) -> String + 'static,
 {
@@ -470,7 +480,7 @@ where
     }
 }
 
-impl<State, F> IntoFunction<bool, State> for F
+impl<State, F> IntoFunction<State, bool> for F
 where
     F: Fn(&mut State, &FuncData) -> bool + 'static,
 {
@@ -501,7 +511,6 @@ pub(super) fn parse_tokens_into_items<State>(
     main_module: &str,
     tokens: Vec<Token>,
     funcs_map_defs: HashMap<&'static str, Function<State>>,
-    state: &mut State,
 ) -> Result<(Vec<Item>, Vec<Option<usize>>, Vec<Function<State>>), ()> {
     let mut parser = ParserData::default();
     let mut funcs = Vec::new();
@@ -517,7 +526,7 @@ pub(super) fn parse_tokens_into_items<State>(
     parser.load_queue.push((main_module.into(), tokens));
 
     while !parser.load_queue.is_empty() {
-        parse_module(&mut parser, &funcs_map, &funcs, state);
+        parse_module(&mut parser, &funcs_map, &funcs);
     }
 
     for (module, imports) in parser.local_imports {
@@ -538,13 +547,18 @@ pub(super) fn parse_tokens_into_items<State>(
             continue;
         };
 
-        if let Item::Option { .. } = parser.items[target_item] {
+        if let Item::Choice { .. }
+        | Item::If {
+            holds_choices: true,
+            ..
+        } = parser.items[target_item]
+        {
             eprintln!("{loc} jumping on options is not allowed :(");
             parser.failed = true;
             continue;
         }
 
-        let Item::Jump(location) = &mut parser.items[jump_item] else {
+        let Item::Jump { target, .. } = &mut parser.items[jump_item] else {
             unreachable!()
         };
 
@@ -554,11 +568,13 @@ pub(super) fn parse_tokens_into_items<State>(
             continue;
         }
 
-        *location = target_item;
+        *target = target_item;
     }
 
     for (vis_change_item, labels) in parser.label_vis_changes {
-        let (Item::Hide(items) | Item::Show(items)) = &mut parser.items[vis_change_item] else {
+        let (Item::Hide { targets, .. } | Item::Show { targets, .. }) =
+            &mut parser.items[vis_change_item]
+        else {
             unreachable!();
         };
 
@@ -569,7 +585,7 @@ pub(super) fn parse_tokens_into_items<State>(
                 continue;
             };
 
-            items.push(*target_item);
+            targets.push(*target_item);
         }
     }
 
@@ -595,7 +611,6 @@ fn parse_module<State>(
     }: &mut ParserData,
     funcs_map: &HashMap<&'static str, usize>,
     funcs: &[Function<State>],
-    state: &mut State,
 ) {
     macro_rules! fail {
         () => {{
@@ -673,7 +688,7 @@ fn parse_module<State>(
                     let _ = tokens.next();
                 }
 
-                if let Ok(parsed_phrase) = parse_phrase((token_loc, &p), funcs_map, funcs, state) {
+                if let Ok(parsed_phrase) = parse_phrase((token_loc, &p), funcs_map, funcs) {
                     parsed_phrase
                 } else {
                     fail!();
@@ -693,7 +708,6 @@ fn parse_module<State>(
                     let this = module_items.len();
                     welcome_to_the_family(
                         this,
-                        this.checked_sub(1),
                         &mut parents,
                         &mut sibling_idx,
                         &item_depth,
@@ -753,57 +767,70 @@ fn parse_module<State>(
                     true,
                     Item::Response {
                         phrase,
-                        options: Vec::new(),
+                        choices: Vec::new(),
                     }
                 );
             }
-            TokenKind::Option(phrase) => {
+            TokenKind::Choice(phrase) => {
                 let phrase = collect_whole_phrase!(phrase);
                 register_state_item!(false);
 
-                let Some(Ok(opt_handler)) = (0..module_items.len())
-                    .rev()
-                    .filter(|i| !matches!(&module_items[*i], Item::Option { .. }))
-                    .find_map(|i| {
-                        if item_depth[i] < item_depth[this_item] {
-                            return Some(Err(()));
+                let mut search_depth = item_depth[this_item];
+                let mut conditions = Vec::<usize>::new();
+
+                let handler_search_result = (0..module_items.len()).rev().find_map(|i| {
+                    if let Item::If { holds_choices, .. } = &mut module_items[i] {
+                        if token_depth <= item_depth[i] {
+                            return None;
                         }
 
-                        (item_depth[i] == item_depth[this_item]).then_some(Ok(i))
-                    })
-                else {
-                    fail!(
-                        "{module_name}:{token_loc} couldn't find an option handler for {phrase:?} on this depth"
-                    );
-                    continue;
-                };
+                        *holds_choices = true;
+                        conditions.push(i);
+                        search_depth = item_depth[i];
+                        None
+                    } else if item_depth[i] < search_depth {
+                        println!("{phrase:?} {i}");
+                        Some(Err(()))
+                    } else if item_depth[i] > search_depth {
+                        None
+                    } else if let Item::Choice { .. } = &module_items[i] {
+                        None
+                    } else {
+                        Some(Ok(i))
+                    }
+                });
 
-                sibling_idx.push(sibling_idx[opt_handler]);
-                parents.push(Some(opt_handler));
-                module_items.push(Item::Option { phrase });
-
-                match &mut module_items[opt_handler] {
-                    Item::Response { options, .. } => options.push(this_item),
-                    Item::Option { .. } => unreachable!(),
-                    _ => {
+                let opt_handler = match handler_search_result {
+                    Some(Ok(h)) => h,
+                    Some(Err(())) | None => {
                         fail!(
-                            "{module_name}:{token_loc} options can only belong to responses, defined with `-`"
+                            "{module_name}:{token_loc} couldn't find an option handler for {phrase:?} on this depth"
                         );
                         continue;
                     }
                 };
+
+                sibling_idx.push(sibling_idx[opt_handler]);
+                parents.push(Some(opt_handler));
+                module_items.push(Item::Choice {
+                    conditions,
+                    phrase,
+                    display: true,
+                });
+
+                if let Item::Response { choices, .. } = &mut module_items[opt_handler] {
+                    choices.push(this_item);
+                } else {
+                    fail!(
+                        "{module_name}:{token_loc} options can only belong to responses, defined with `-`"
+                    );
+                }
             }
             TokenKind::Function {
                 kind: kind @ FunctionKind::Jump,
                 mut args,
-                is_comptime,
+                once,
             } => {
-                if is_comptime {
-                    fail!(
-                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
-                    )
-                }
-
                 if args.len() > 1 {
                     fail!(
                         "{module_name}:{token_loc} too many arguments for `{kind}` function, expected only one label"
@@ -879,16 +906,16 @@ fn parse_module<State>(
                     "it seems like jump got overwritten, is it even possilbe?"
                 );
 
-                register_state_item!(true, Item::Jump(0));
+                register_state_item!(true, Item::Jump { target: 0, once });
             }
             TokenKind::Function {
                 kind: kind @ FunctionKind::End,
-                is_comptime,
+                once,
                 args,
             } => {
-                if is_comptime {
+                if once {
                     fail!(
-                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
+                        "{module_name}:{token_loc} `{kind}` doesn't support `once` evaluation, cause why lol?"
                     )
                 }
 
@@ -903,12 +930,12 @@ fn parse_module<State>(
             }
             TokenKind::Function {
                 kind: kind @ FunctionKind::As,
-                is_comptime,
+                once,
                 mut args,
             } => {
-                if is_comptime {
+                if once {
                     fail!(
-                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
+                        "{module_name}:{token_loc} `{kind}` is compile time function, it doesn't support `once` evaluation"
                     )
                 }
 
@@ -924,16 +951,16 @@ fn parse_module<State>(
                 }
 
                 let Some((label_loc, label)) = args.pop() else {
-                    fail!("{module_name}:{token_loc} expected label name for `as` function");
+                    fail!("{module_name}:{token_loc} expected label name for `{kind}` function");
                     continue;
                 };
 
                 if label_to_assign.is_some() {
-                    fail!("{module_name}:{token_loc} function `as` cannot be labeled");
+                    fail!("{module_name}:{token_loc} function `{kind}` cannot be labeled");
                 }
 
                 if tokens.peek().is_none() {
-                    fail!("{module_name}:{token_loc} standalone `as` function is not allowed");
+                    fail!("{module_name}:{token_loc} standalone `{kind}` function is not allowed");
                 }
 
                 let name = make_label(&module_name, &label);
@@ -950,11 +977,11 @@ fn parse_module<State>(
             TokenKind::Function {
                 kind: kind @ FunctionKind::Import,
                 mut args,
-                is_comptime,
+                once,
             } => {
-                if is_comptime {
+                if once {
                     fail!(
-                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
+                        "{module_name}:{token_loc} `{kind}` is compile time function, it doesn't support `once` evaluation"
                     )
                 }
 
@@ -1001,14 +1028,8 @@ fn parse_module<State>(
             TokenKind::Function {
                 kind: kind @ (FunctionKind::Hide | FunctionKind::Show),
                 mut args,
-                is_comptime,
+                once,
             } => {
-                if is_comptime {
-                    fail!(
-                        "{module_name}:{token_loc} `{kind}` cannot use `!` compile time evaluation"
-                    )
-                }
-
                 if !func_signature_is_valid(&module_name, &args, &['.']) {
                     fail!();
                     continue;
@@ -1016,7 +1037,7 @@ fn parse_module<State>(
 
                 register_state_item!(true);
 
-                let target_items = if args.is_empty() {
+                let targets = if args.is_empty() {
                     let Some(parent) = parents[this_item] else {
                         fail!(
                             "{module_name}:{token_loc} this `hide` function without arguments affect it's parent, which is not present in our case :(",
@@ -1036,43 +1057,91 @@ fn parse_module<State>(
                 };
 
                 match kind {
-                    FunctionKind::Hide => module_items.push(Item::Hide(target_items)),
-                    FunctionKind::Show => module_items.push(Item::Show(target_items)),
+                    FunctionKind::Hide => module_items.push(Item::Hide { targets, once }),
+                    FunctionKind::Show => module_items.push(Item::Show { targets, once }),
                     _ => unreachable!(),
                 }
             }
             TokenKind::Function {
+                kind: kind @ FunctionKind::If,
+                args,
+                once,
+            } => {
+                let Some((fn_loc, fn_name)) = args.first() else {
+                    fail!(
+                        "{module_name}:{token_loc} expected condition function name for `{kind}`"
+                    );
+                    continue;
+                };
+
+                let Some(func) = funcs_map.get(fn_name.as_str()).copied() else {
+                    fail!("{module_name}:{fn_loc} function `{fn_name}` is undefined");
+                    continue;
+                };
+
+                if !matches!(&funcs[func], Function::Bool(_)) {
+                    fail!(
+                        "{module_name}:{fn_loc} function `{fn_name}` must return boolean value for `{kind}`"
+                    );
+                    continue;
+                }
+
+                let Some(next_t) = tokens.peek() else {
+                    fail!("{module_name}:{token_loc} `{kind}` doesn't hold any items");
+                    continue;
+                };
+
+                let Ok(next_t_depth) = get_depth(next_t.indentation, next_t.loc) else {
+                    fail!();
+                    return;
+                };
+
+                if next_t_depth == token_depth {
+                    fail!(
+                        "{module_name}:{token_loc} `{kind}` must hold at least one item indented under it"
+                    );
+                    continue;
+                }
+
+                let args = args
+                    .into_iter()
+                    .skip(1)
+                    .map(|(_, a)| a)
+                    .collect::<Vec<String>>();
+
+                let func_data = FuncData {
+                    once,
+                    args,
+                    call_location: token_loc,
+                };
+
+                register_state_item!(
+                    true,
+                    Item::If {
+                        holds_choices: false,
+                        func,
+                        func_data,
+                        next: None,
+                    }
+                );
+            }
+            TokenKind::Function {
                 kind: FunctionKind::Custom(fn_name),
                 args,
-                is_comptime,
+                once,
             } => {
-                let func = (token_loc, fn_name);
-
-                let Some(func) = funcs_map.get(func.1.as_str()).copied() else {
-                    fail!(
-                        "{module_name}:{token_loc} function `{}` is undefined",
-                        func.1
-                    );
+                let Some(func) = funcs_map.get(fn_name.as_str()).copied() else {
+                    fail!("{module_name}:{token_loc} function `{fn_name}` is undefined",);
                     continue;
                 };
 
                 let args = args.into_iter().map(|(_, a)| a).collect::<Vec<String>>();
 
                 let func_data = FuncData {
-                    is_comptime,
+                    once,
                     args,
                     call_location: token_loc,
                 };
-
-                if is_comptime {
-                    if label_to_assign.is_some() {
-                        fail!(
-                            "{module_name}:{token_loc} you cannot assign label for compile time function, it will not be present at runtime, bruh, obviously",
-                        );
-                    }
-
-                    funcs[func].call_drop(state, &func_data);
-                }
 
                 register_state_item!(true, Item::FunctionCall { func, func_data })
             }
@@ -1120,7 +1189,7 @@ impl Phrase {
 
         buffer.clear();
 
-        for part in parts {
+        for part in parts.iter_mut() {
             match part {
                 PhraseParts::Static(t) => buffer.push_str(t),
                 PhraseParts::FromFunction { func, func_data } => {
@@ -1130,9 +1199,18 @@ impl Phrase {
                         unreachable!();
                     };
 
-                    let _ = write!(buffer, "{}", f(state, func_data));
+                    let output = f(state, func_data);
+                    let _ = write!(buffer, "{output}");
+
+                    if func_data.once {
+                        *part = PhraseParts::Static(output);
+                    }
                 }
             }
+        }
+
+        if parts.iter().all(|p| matches!(p, PhraseParts::Static(_))) {
+            *self = Phrase::Static(std::mem::take(buffer));
         }
     }
 }
@@ -1147,7 +1225,6 @@ fn parse_phrase<State>(
     (mut phrase_loc, input): (Loc, &str),
     funcs_map: &HashMap<&'static str, usize>,
     funcs: &[Function<State>],
-    state: &mut State,
 ) -> Result<Phrase, ()> {
     let mut failed = false;
     let mut parts = Vec::<PhraseParts>::new();
@@ -1174,7 +1251,7 @@ fn parse_phrase<State>(
 
     let mut buf = String::new();
     while let Some((_, ch)) = stream.next() {
-        if ch != '@' {
+        if ch != '#' {
             buf.push(ch);
             continue;
         }
@@ -1198,28 +1275,18 @@ fn parse_phrase<State>(
             buf.clear()
         }
 
-        let (func_loc, is_comptime, fn_name) = match collect_func_name_until('}', &mut stream) {
+        let (func_loc, once, fn_name, args) = match collect_func_until('}', &mut stream) {
             Ok(f) => f,
-            Err(WordErr::ReachedDelimiter | WordErr::EndOfStream) => {
+            Err(WordErr::EndOfStream) => {
+                eprintln!("{next_ch_loc} could not find '}}' closing delimiter");
+                return Err(());
+            }
+            Err(WordErr::ReachedDelimiter) => {
                 eprintln!("{next_ch_loc} expected function name within `@{{}}`");
                 return Err(());
             }
             Err(WordErr::UnclosedQuotes) => return Err(()),
         };
-
-        let mut func_args = Vec::new();
-
-        loop {
-            match collect_word_until('}', &mut stream) {
-                Ok(arg) => func_args.push(arg),
-                Err(WordErr::EndOfStream) => {
-                    eprintln!("{next_ch_loc} could not find '}}' closing delimiter");
-                    return Err(());
-                }
-                Err(WordErr::ReachedDelimiter) => break,
-                Err(WordErr::UnclosedQuotes) => return Err(()),
-            }
-        }
 
         let FunctionKind::Custom(fn_name) = FunctionKind::from_str(&fn_name) else {
             eprintln!("{func_loc} builtin function `{fn_name}` doesn't return displayable value");
@@ -1233,7 +1300,7 @@ fn parse_phrase<State>(
             continue;
         };
 
-        let args = func_args
+        let args = args
             .into_iter()
             .skip(1)
             .map(|(_, a)| a)
@@ -1241,34 +1308,17 @@ fn parse_phrase<State>(
 
         let func_data = FuncData {
             args,
-            is_comptime,
+            once,
             call_location: func_loc,
         };
 
-        if is_comptime {
-            let Function::String(f) = &funcs[func] else {
-                eprintln!("{func_loc} this function doesn't return a displayable value");
-                failed = true;
-                continue;
-            };
+        if !matches!(funcs[func], Function::String(_)) {
+            eprintln!("{func_loc} function doesn't return a displayable value");
+            failed = true;
+            continue;
+        };
 
-            let output = f(state, &func_data);
-
-            if let Some(PhraseParts::Static(ph)) = parts.last_mut() {
-                ph.push_str(&output);
-                continue;
-            } else {
-                parts.push(PhraseParts::Static(output));
-            }
-        } else {
-            if !matches!(funcs[func], Function::String(_)) {
-                eprintln!("{func_loc} function doesn't return a displayable value");
-                failed = true;
-                continue;
-            };
-
-            parts.push(PhraseParts::FromFunction { func, func_data });
-        }
+        parts.push(PhraseParts::FromFunction { func, func_data });
     }
 
     if !buf.is_empty() {
@@ -1343,32 +1393,106 @@ fn link_state_items(
 ) -> Vec<Option<usize>> {
     let mut links = vec![None::<usize>; items.len()];
     let mut states = Vec::<usize>::new();
+    let items_len = items.len();
 
-    for (item, kind) in items.iter().enumerate() {
-        // filter out options,
-        if let Item::Option { .. } | Item::End = kind {
+    for item in 0..items_len {
+        if let Item::Choice { .. }
+        | Item::End
+        | Item::If {
+            holds_choices: true,
+            ..
+        } = &items[item]
+        {
             continue;
         }
 
+        // if let Some((
+        //     Some(Item::If {
+        //         next,
+        //         holds_choices,
+        //         ..
+        //     }),
+        //     other_items,
+        // )) = items
+        //     .split_at_mut_checked(item + 1)
+        //     .map(|(left, right)| (left.last_mut(), right))
+        // {
+        //     let if_depth = items_depth[item];
+        //     let offset = item + 1;
+
+        //     *next = (0..other_items.len())
+        //         .find_map(|i| {
+        //             let next_item = offset + i;
+        //             let next_item_depth = items_depth[next_item];
+
+        //             if if_depth < next_item_depth {
+        //                 None
+        //             } else if if_depth > next_item_depth {
+        //                 Some(Err(()))
+        //             } else {
+        //                 Some(Ok(next_item))
+        //             }
+        //         })
+        //         .and_then(|res| res.ok());
+
+        //     if *holds_choices {
+        //         continue;
+        //     }
+
+        // TODO:
+        // for (item, kind) in items.iter().enumerate() {
+        //     if let Item::If {
+        //         holds_choices: true,
+        //         fallback,
+        //         ..
+        //     } = &mut module_items[item]
+        //     {
+        //         let until = fallback.unwrap_or(module_items.len());
+        //         if module_items[item + 1..until]
+        //             .iter()
+        //             .any(|i| !matches!(i, Item::Choice { .. }))
+        //         {
+        //             // TODO: loc vector for all pushed items maybe
+        //             fail!("{module_name}: this `if` holds choices, so cannot hold any other item kinds but choices");
+        //         }
+        //     }
+        // }
+        // }
+
         // link previous item with this state item
-        if let Some(prev_item_link @ None) = item
+        if let Some(prev_item) = item
             .checked_sub(1)
             .filter(|prev_item| !matches!(items[*prev_item], Item::End))
-            .map(|prev_item| &mut links[prev_item])
         {
-            *prev_item_link = Some(item + link_offset);
+            let link = if let Item::If { next, .. } = &mut items[prev_item] {
+                next
+            } else if let link @ None = &mut links[prev_item] {
+                link
+            } else {
+                continue;
+            };
+
+            *link = Some(item + link_offset);
         }
 
         states.push(item);
     }
 
+    // let items_len = items.len();
+    // let states_len = states.len();
+
     for i in 0..states.len() {
         let this_state = states[i];
 
         let maybe_options = match &items[this_state] {
-            Item::Response { options, .. } => Some(options),
-            Item::FunctionCall { .. } | Item::Jump(_) | Item::Hide(_) | Item::Show(_) => None,
-            Item::End | Item::Option { .. } => unreachable!(),
+            Item::Response { choices, .. } => Some(choices),
+            Item::If { .. }
+            | Item::Nop
+            | Item::FunctionCall { .. }
+            | Item::Jump { .. }
+            | Item::Hide { .. }
+            | Item::Show { .. } => None,
+            Item::End | Item::Choice { .. } => unreachable!(),
         };
 
         if links[this_state].is_some()
@@ -1388,8 +1512,8 @@ fn link_state_items(
             continue;
         };
 
-        for opt in options {
-            let next @ None = &mut links[*opt] else {
+        for &opt in options {
+            let next @ None = &mut links[opt] else {
                 continue;
             };
 
@@ -1422,7 +1546,7 @@ fn get_depth_from_indent(
 
     if got_amount % single_amount != 0 {
         eprintln!(
-            "{loc} inconsistent amount of {indent}: expected {single_amount} as a single_indent, but got {got_amount} total"
+            "{loc} inconsistent amount of {indent}: expected {single_amount} as a single, but got {got_amount} total"
         );
         return Err(());
     }
@@ -1432,7 +1556,6 @@ fn get_depth_from_indent(
 
 fn welcome_to_the_family(
     new_item: usize,
-    maybe_prev_item: Option<usize>,
     parents: &mut Vec<Option<usize>>,
     sibling_idx: &mut Vec<u32>,
     item_depth: &[u32],
@@ -1440,7 +1563,7 @@ fn welcome_to_the_family(
     let mut sib_idx = 0;
     let mut parent = None::<usize>;
 
-    if let Some(prev_item) = maybe_prev_item {
+    if let Some(prev_item) = new_item.checked_sub(1) {
         // if last state is a sibling
         if item_depth[prev_item] == item_depth[new_item] {
             sib_idx = sibling_idx[prev_item] + 1;

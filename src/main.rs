@@ -5,8 +5,9 @@ use lexer::{FuncData, Function, Item, Phrase};
 use std::collections::HashMap;
 use std::path::Path;
 
+// TODO: push phrase continuation on tokenization step, so on parsing i can just throw an error if any PhraseContinuation left
+// TODO: rework "isolated blocks" make the not isolated, but create Item::Block that can be hidden along with related items
 // TODO: when reporting errors use full path
-// TODO: checking return type on dummmy is bad idea because the function may return other types in some cases
 // TODO: escape `"` for quoted words
 // TODO: how to treat this case:
 //      @{
@@ -64,24 +65,21 @@ impl<ExternalState> Compiler<ExternalState> {
     pub fn register_function<T>(
         mut self,
         name: &'static str,
-        f: impl lexer::IntoFunction<T, ExternalState>,
+        f: impl lexer::IntoFunction<ExternalState, T>,
     ) -> Self {
         self.funcs_map.insert(name, f.into_function());
         self
     }
 
     pub fn compile_source_as(
-        mut self,
+        self,
         module_name: impl AsRef<str>,
         source: impl AsRef<str>,
     ) -> Result<Conversation<ExternalState>, Error> {
         let tokens = lexer::tokenize(source.as_ref());
-        let Ok((items, links, funcs)) = lexer::parse_tokens_into_items(
-            module_name.as_ref(),
-            tokens,
-            self.funcs_map,
-            &mut self.state,
-        ) else {
+        let Ok((items, links, funcs)) =
+            lexer::parse_tokens_into_items(module_name.as_ref(), tokens, self.funcs_map)
+        else {
             return Err(Error::ParsingSource);
         };
 
@@ -115,11 +113,12 @@ impl<ExternalState> Compiler<ExternalState> {
             Error::ReadingInputFile
         })?;
 
-        self.compile_source_as(src, module_name)
+        self.compile_source_as(module_name, src)
     }
 }
 
 pub struct State<'s> {
+    vis: &'s [bool],
     items: &'s [Item],
     current: usize,
 }
@@ -133,14 +132,10 @@ impl<'s> State<'s> {
         phrase.as_nonempty_str()
     }
 
-    pub fn options(&self) -> impl Iterator<Item = &str> {
-        let Item::Response { options, .. } = &self.items[self.current] else {
-            unreachable!();
-        };
-
-        options.iter().copied().map(|opt| {
-            let Item::Option { phrase, .. } = &self.items[opt] else {
-                unreachable!();
+    pub fn choices(&self) -> impl Iterator<Item = &str> {
+        self.choice_indices().map(|ch| {
+            let Item::Choice { phrase, .. } = &self.items[ch] else {
+                unreachable!()
             };
 
             let (Phrase::Static(buffer) | Phrase::Dynamic { buffer, .. }) = &phrase;
@@ -149,12 +144,21 @@ impl<'s> State<'s> {
         })
     }
 
-    fn option_indices(&self) -> impl Iterator<Item = usize> {
-        let Item::Response { options, .. } = &self.items[self.current] else {
+    fn choice_indices(&self) -> impl Iterator<Item = usize> {
+        let Item::Response { choices, .. } = &self.items[self.current] else {
             unreachable!();
         };
 
-        options.iter().copied()
+        choices
+            .iter()
+            .filter(|&&ch| {
+                let Item::Choice { display, .. } = &self.items[ch] else {
+                    unreachable!()
+                };
+
+                self.vis[ch] && *display
+            })
+            .copied()
     }
 }
 
@@ -177,104 +181,193 @@ impl<ExternalState> Conversation<ExternalState> {
                 return false;
             };
 
-            let Some(item) = self.items.get(current) else {
+            let Some(item) = self.items.get_mut(current) else {
                 return false;
             };
 
             match item {
                 _ if !self.vis[current] => self.next = self.links[current],
+                Item::Nop => self.next = self.links[current],
+                Item::Response { .. } => {
+                    self.update_phrases_in_state();
+                    self.next = self.links[current];
+                    break current;
+                }
+                Item::If {
+                    func,
+                    func_data,
+                    next,
+                    ..
+                } => {
+                    let Function::Bool(f) = &self.funcs[*func] else {
+                        unreachable!();
+                    };
+
+                    let passed = f(&mut self.state, func_data);
+
+                    let next = if passed { *next } else { self.links[current] };
+
+                    self.next = next;
+
+                    if func_data.once {
+                        *item = Item::Nop;
+                        if passed {
+                            self.links[current] = next;
+                        }
+                    }
+                }
                 Item::End => {
                     self.next = None;
                     return false;
                 }
-                Item::Response { .. } => {
-                    self.update_phrases_in_state(current);
-                    self.next = self.links[current];
-                    break current;
-                }
-                Item::Show(items) => {
-                    for item in items {
+                Item::Show { targets, once } => {
+                    for item in targets {
                         self.vis[*item] = true;
                     }
+
                     self.next = self.links[current];
+
+                    if *once {
+                        *item = Item::Nop
+                    }
                 }
-                Item::Hide(items) => {
-                    for item in items {
+                Item::Hide { targets, once } => {
+                    for item in targets {
                         self.vis[*item] = false;
                     }
+
                     self.next = self.links[current];
+
+                    if *once {
+                        *item = Item::Nop
+                    }
                 }
-                Item::Jump(target) => {
+                Item::Jump { target, once } => {
                     self.next = Some(*target);
+
+                    if *once {
+                        *item = Item::Nop
+                    }
                 }
                 Item::FunctionCall { func, func_data } => {
                     self.funcs[*func].call_drop(&mut self.state, func_data);
                     self.next = self.links[current];
+
+                    if func_data.once {
+                        *item = Item::Nop
+                    }
                 }
-                Item::Option { .. } => unreachable!(),
+                Item::Choice { .. } => unreachable!(),
             }
         });
 
         true
     }
 
-    fn next_state_from_option(&mut self, option_idx: usize) -> bool {
+    fn next_state_from_choice(&mut self, option_idx: usize) -> Option<bool> {
         let Some(current) = self.current else {
-            return false;
+            return Some(false);
         };
 
-        let Item::Response { options, .. } = &self.items[current] else {
+        let Item::Response { choices, .. } = &self.items[current] else {
             unreachable!();
         };
 
-        // TODO: i am trying to avoid any runtime errors from murmur
-        //      what should i do here?
-        self.next = options
-            .iter()
-            .filter(|&&opt| self.vis[opt])
-            .nth(option_idx)
-            .and_then(|&opt| self.links[opt]);
+        let choice = choices.iter().filter(|&&ch| self.vis[ch]).nth(option_idx)?;
 
+        self.next = self.links[*choice];
 
-        self.next_state()
+        Some(self.next_state())
     }
 
     fn current_state<'s>(&'s self) -> Option<State<'s>> {
         self.current.map(|current| State {
+            vis: &self.vis,
             items: &self.items,
             current,
         })
     }
 
-    fn update_phrases_in_state(&mut self, state: usize) {
-        let Item::Response { phrase, .. } = &mut self.items[state] else {
-            unreachable!();
-        };
-
-        phrase.update(&self.funcs, &mut self.state);
+    fn update_phrases_in_state(&mut self) {
+        let state = self.current.expect("caller to be sure about calling this");
 
         let Some((left, right)) = self.items.split_at_mut_checked(state + 1) else {
             return;
         };
 
-        let Some(Item::Response { options, .. }) = left.last_mut() else {
+        let Some(Item::Response { choices, phrase }) = left.last_mut() else {
             unreachable!();
         };
 
+        phrase.update(&self.funcs, &mut self.state);
+
         let offset = state + 1;
+        // TODO: maybe conditions buffer inside of the Conversation
+        let mut checked = HashMap::<usize, bool>::new();
+        for c in choices.iter() {
+            let choice = *c - offset;
 
-        for &option in options.iter() {
-            let opt = option - offset;
-
-            if !self.vis[opt] {
+            if !self.vis[choice] {
                 continue;
             }
 
-            let Item::Option { phrase } = &mut right[opt] else {
+            let (
+                conds,
+                [
+                    Item::Choice {
+                        conditions,
+                        phrase,
+                        display,
+                    },
+                    ..,
+                ],
+            ) = right.split_at_mut_checked(choice).unwrap()
+            else {
                 unreachable!();
             };
 
-            phrase.update(&self.funcs, &mut self.state);
+            // reversing conditions because we pushed them on parsing stage in the wrong order
+            let all_passed = conditions.iter().rev().all(|cond_item| {
+                let cond_with_offset = cond_item - offset;
+                let (passed, once, next) = {
+                    let Item::If {
+                        func,
+                        func_data,
+                        next,
+                        ..
+                    } = &mut conds[cond_with_offset]
+                    else {
+                        unreachable!();
+                    };
+
+                    if let Some(check_result) = checked.get(cond_item) {
+                        return *check_result;
+                    }
+
+                    let Function::Bool(f) = &self.funcs[*func] else {
+                        unreachable!();
+                    };
+
+                    let passed = f(&mut self.state, func_data);
+                    assert!(checked.insert(*cond_item, passed).is_none());
+
+                    (passed, func_data.once, *next)
+                };
+
+                if once {
+                    conds[cond_with_offset] = Item::Nop;
+                    if passed {
+                        self.links[*cond_item] = next;
+                    }
+                }
+
+                passed
+            });
+
+            *display = all_passed;
+            if all_passed {
+                phrase.update(&self.funcs, &mut self.state);
+            }
         }
     }
 }
@@ -299,9 +392,9 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
             None => writeln!(out, "End]")?,
         }
 
-        for (i, (phrase, opt)) in state.options().zip(state.option_indices()).enumerate() {
-            write!(out, "({i}) > {phrase:?} [{opt} -> ")?;
-            match &conv.links[opt] {
+        for (i, (phrase, ch)) in state.choices().zip(state.choice_indices()).enumerate() {
+            write!(out, "({i}) > {phrase:?} [{ch} -> ")?;
+            match &conv.links[ch] {
                 Some(next) => writeln!(out, "{next}]")?,
                 None => writeln!(out, "End]")?,
             }
@@ -315,7 +408,7 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
             let input = input.trim();
 
             if let Ok(opt_idx) = input.parse::<usize>() {
-                break conv.next_state_from_option(opt_idx);
+                break conv.next_state_from_choice(opt_idx).unwrap();
             } else if input.is_empty() {
                 break conv.next_state();
             };
@@ -329,7 +422,7 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
     Ok(())
 }
 
-const TEST_CONVO: &str = "
+const _TEST_CONVO: &str = "
 -       1 -> 16 @{
 
     chel }
@@ -351,8 +444,8 @@ const TEST_CONVO: &str = "
 - ....
 
 
-# @if test
-# @jump bubu
+# if test
+# jump bubu
 
 -       1 -> 16 @{
 
@@ -384,39 +477,48 @@ const TEST_CONVO: &str = "
 @ jump test.Test # 23 -> 24 which is in test.mur file
 ";
 
+// TODO: location of phrases must point on first non-whitespace
 const TEST_CONVO2: &str = r#"
-- I am tired to make something funny
-  \        < this shit is not trimmed after '\'
-  # Hello I am a comment in the middle of the phrase for some reason!!?!?
-  \    #   < look this is escaped and not treated as comment 0_0
-  And I am just a casual new line without indentation..
-- suka
-> one
-    @ aboba
-> two
-- @ "print hello" "#;
 
-fn test(_: &mut usize, func: &FuncData) -> String {
-    if func.is_comptime {
-        println!("calling function once");
-    }
+#as test
+- test1  #{
 
-    "hello".into()
+
+
+name # i don't like your face
+
 }
+
+# !if true "checking"
+    - test 2
+
+#jump test
+"#;
 
 fn main() {
     let Ok(convo) = Compiler::new(0usize)
-        .register_function("test suka", test)
-        .register_function("print hello", |_: &mut usize, d: &FuncData| {
-            println!("hello {}", d.is_comptime)
+        .register_function("true", |_: &mut usize, d: &FuncData| {
+            println!("true: {msg}", msg = d.args[0]);
+            true
         })
-        .register_function("aboba", |_: &mut usize, d: &FuncData| {
-            println!("aboba {}", d.is_comptime)
+        .register_function("false", |_: &mut usize, d: &FuncData| {
+            println!("false: {msg}", msg = d.args[0]);
+            false
+        })
+        .register_function("dbg", |_: &mut usize, d: &FuncData| {
+            println!("{}", d.args[0]);
+        })
+        .register_function("name", |state: &mut usize, _: &FuncData| {
+            let x = ["one", "two", "three"];
+            let r = x[*state].to_string();
+            *state += 1;
+            r
         })
         .compile_source_as("main", TEST_CONVO2)
     else {
         return;
     };
-    println!("{:#?}", convo.links);
+
+    // panic!("{:#?}\n{:#?}", convo.items, convo.links);
     run(convo).unwrap();
 }
