@@ -99,14 +99,12 @@ The layer between builtin and your externally defined functions is very thin bec
 #### `#<func> [args ...]`
 Calls a custom function. Your custom functions will be defined via hash map, that you pass to the parser.
 ```rust
-fn complain(my_state: &mut MyState, d: FuncData) -> ReturnValue {
+fn complain(my_state: &mut MyState, d: FuncData) {
     println!("I love you! Why can't you see that, {name}?!", name = d.args[0]);
     my_state.psychological -= 1;
-
-    ReturnValue::None // or ().into(), doesn't matter in this case, because value will be dropped anyway
 }
 
-funcs_map.insert("complain_to", complain as _);
+compiler.register_function("complain_to", complain);
 // pass the map to the Conversation::load
 ```
 and then in *murmur* file:
@@ -179,6 +177,7 @@ Will disable/enable the specified items, causing them to be skipped. If no label
 #show where how_much
 #jump useful_convo
 ```
+By indenting 
 
 #### `#end`
 Immediately ends the conversation. Cannot call it with `!`, obviously..

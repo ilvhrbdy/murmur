@@ -5,17 +5,7 @@ use lexer::{FuncData, Function, Item, Phrase};
 use std::collections::HashMap;
 use std::path::Path;
 
-// TODO: push phrase continuation on tokenization step, so on parsing i can just throw an error if any PhraseContinuation left
-// TODO: rework "isolated blocks" make the not isolated, but create Item::Block that can be hidden along with related items
 // TODO: when reporting errors use full path
-// TODO: escape `"` for quoted words
-// TODO: how to treat this case:
-//      @{
-//              func "hello
-//              world"
-//      }
-//
-//      same rules as with PhraseContinuation? so remove only depth level and keep the rest? but it means i need to collect indentation of the interpolation block
 // TODO: need to do something with cases like this:
 //
 //
@@ -27,19 +17,19 @@ use std::path::Path;
 //
 // i mean it is a logical error, not a problem of the language, but maybe a debuger mode for murmur cli or some sort of to debug behaviour of the script
 
-// TODO: `@def <temlate name> [$args] <block>` macro and expanding it with
-//      @ <module>.<template> for expanding macro from other module
-//      @ .<tempate> for current module
-// same for interpolation @{ .<template> }
+// TODO: `#def <temlate name> [$args] <block>` macro and expanding it with
+//      # <module>.<template> for expanding macro from other module
+//      # .<tempate> for current module
+// same for interpolation #{ .<template> }
 // so it expands either as text or code depending on the context of expansion
-// @def string Aboba
+// #def string Aboba
 // or
-// @def custom_jump $name @jump $name
+// #def custom_jump $name #jump $name
 // or
-// @def block $opt
+// #def block $opt
 //      - aboba
 //      > $opt
-// TODO: @if @elif @else
+// TODO: #if #elif #else
 // TODO: write tests, please?
 // TODO: normal error messages
 
@@ -76,9 +66,13 @@ impl<ExternalState> Compiler<ExternalState> {
         module_name: impl AsRef<str>,
         source: impl AsRef<str>,
     ) -> Result<Conversation<ExternalState>, Error> {
-        let tokens = lexer::tokenize(source.as_ref());
+        let module_name = module_name.as_ref();
+        let Ok(tokens) = lexer::tokenize(module_name, source.as_ref()) else {
+            return Err(Error::ParsingSource);
+        };
+
         let Ok((items, links, funcs)) =
-            lexer::parse_tokens_into_items(module_name.as_ref(), tokens, self.funcs_map)
+            lexer::parse_tokens_into_items(module_name, tokens, self.funcs_map)
         else {
             return Err(Error::ParsingSource);
         };
@@ -92,6 +86,7 @@ impl<ExternalState> Compiler<ExternalState> {
         let mut it = Conversation {
             state: self.state,
             funcs,
+            _if_checkes_buffer: HashMap::new(),
             vis: vec![true; items.len()],
             current,
             next,
@@ -126,7 +121,7 @@ pub struct State<'s> {
 impl<'s> State<'s> {
     pub fn response(&self) -> Option<&str> {
         let Item::Response { phrase, .. } = &self.items[self.current] else {
-            unreachable!();
+            unreachable!("{:?}", &self.items[self.current]);
         };
 
         phrase.as_nonempty_str()
@@ -166,6 +161,7 @@ pub struct Conversation<ExternalState> {
     state: ExternalState,
     funcs: Vec<Function<ExternalState>>,
 
+    _if_checkes_buffer: HashMap<usize, bool>,
     vis: Vec<bool>,
     items: Vec<Item>,
     links: Vec<Option<usize>>,
@@ -176,22 +172,25 @@ pub struct Conversation<ExternalState> {
 
 impl<ExternalState> Conversation<ExternalState> {
     pub fn next_state(&mut self) -> bool {
-        self.current = Some(loop {
+        self.current = loop {
             let Some(current) = self.next else {
-                return false;
+                break None;
             };
 
             let Some(item) = self.items.get_mut(current) else {
-                return false;
+                break None;
             };
 
             match item {
                 _ if !self.vis[current] => self.next = self.links[current],
                 Item::Nop => self.next = self.links[current],
+                Item::Block { next, .. } => {
+                    self.next = *next;
+                }
                 Item::Response { .. } => {
-                    self.update_phrases_in_state();
+                    self.update_phrases_in_state(current);
                     self.next = self.links[current];
-                    break current;
+                    break Some(current);
                 }
                 Item::If {
                     func,
@@ -217,6 +216,7 @@ impl<ExternalState> Conversation<ExternalState> {
                     }
                 }
                 Item::End => {
+                    self.current = None;
                     self.next = None;
                     return false;
                 }
@@ -259,12 +259,12 @@ impl<ExternalState> Conversation<ExternalState> {
                 }
                 Item::Choice { .. } => unreachable!(),
             }
-        });
+        };
 
-        true
+        self.current.is_some()
     }
 
-    fn next_state_from_choice(&mut self, option_idx: usize) -> Option<bool> {
+    pub fn next_state_from_choice(&mut self, option_idx: usize) -> Option<bool> {
         let Some(current) = self.current else {
             return Some(false);
         };
@@ -280,7 +280,7 @@ impl<ExternalState> Conversation<ExternalState> {
         Some(self.next_state())
     }
 
-    fn current_state<'s>(&'s self) -> Option<State<'s>> {
+    pub fn current_state<'s>(&'s self) -> Option<State<'s>> {
         self.current.map(|current| State {
             vis: &self.vis,
             items: &self.items,
@@ -288,9 +288,7 @@ impl<ExternalState> Conversation<ExternalState> {
         })
     }
 
-    fn update_phrases_in_state(&mut self) {
-        let state = self.current.expect("caller to be sure about calling this");
-
+    fn update_phrases_in_state(&mut self, state: usize) {
         let Some((left, right)) = self.items.split_at_mut_checked(state + 1) else {
             return;
         };
@@ -302,8 +300,8 @@ impl<ExternalState> Conversation<ExternalState> {
         phrase.update(&self.funcs, &mut self.state);
 
         let offset = state + 1;
-        // TODO: maybe conditions buffer inside of the Conversation
-        let mut checked = HashMap::<usize, bool>::new();
+
+        self._if_checkes_buffer.clear();
         for c in choices.iter() {
             let choice = *c - offset;
 
@@ -327,7 +325,11 @@ impl<ExternalState> Conversation<ExternalState> {
             };
 
             // reversing conditions because we pushed them on parsing stage in the wrong order
-            let all_passed = conditions.iter().rev().all(|cond_item| {
+            let all_passed = conditions.iter().rev().all(|&cond_item| {
+                if !self.vis[cond_item] {
+                    return false;
+                }
+
                 let cond_with_offset = cond_item - offset;
                 let (passed, once, next) = {
                     let Item::If {
@@ -335,12 +337,15 @@ impl<ExternalState> Conversation<ExternalState> {
                         func_data,
                         next,
                         ..
-                    } = &mut conds[cond_with_offset]
+                    } = (match &mut conds[cond_with_offset] {
+                        Item::Block { .. } => return true,
+                        it => it,
+                    })
                     else {
                         unreachable!();
                     };
 
-                    if let Some(check_result) = checked.get(cond_item) {
+                    if let Some(check_result) = self._if_checkes_buffer.get(&cond_item) {
                         return *check_result;
                     }
 
@@ -349,7 +354,7 @@ impl<ExternalState> Conversation<ExternalState> {
                     };
 
                     let passed = f(&mut self.state, func_data);
-                    assert!(checked.insert(*cond_item, passed).is_none());
+                    assert!(self._if_checkes_buffer.insert(cond_item, passed).is_none());
 
                     (passed, func_data.once, *next)
                 };
@@ -357,7 +362,7 @@ impl<ExternalState> Conversation<ExternalState> {
                 if once {
                     conds[cond_with_offset] = Item::Nop;
                     if passed {
-                        self.links[*cond_item] = next;
+                        self.links[cond_item] = next;
                     }
                 }
 
@@ -422,78 +427,19 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
     Ok(())
 }
 
-const _TEST_CONVO: &str = "
--       1 -> 16 @{
-
-    chel }
-
-# nice
-
-@import test
-
-@as suka
-    - 23 -> 24, which is a jump to `start`
-    @jump test.Test # 24 -> 0
-
-@as start
-- lasdkfj @{   dura suka } 1 -> 16 @{ boba salupa }
-
-@!as s@u.ka kuka
-    -
-@as suka
-- ....
-
-
-# if test
-# jump bubu
-
--       1 -> 16 @{
-
-    chel }
-> 2 -> 3
-    - 3 -> 16
-    > 4 -> 5
-        - 5 -> 16
-    > 6 -> 7
-        - 7 -> 10
-        > 8 -> 10
-        > 9 -> 10
-
-        - 10 -> 16
-        > 11 -> 16
-> 12 -> 13
-    - 13 -> 14
-    - 14 -> 16
-    > 15 -> 16
-
-
-- 16 -> 17
-
-- 17 -> 18
-    - 18 -> 20
-    > 19 -> 20
-
-- 20 -> 21 which is a jump to a test.mur file -> 22
-@ jump test.Test # 23 -> 24 which is in test.mur file
-";
-
-// TODO: location of phrases must point on first non-whitespace
-const TEST_CONVO2: &str = r#"
-
+const TEST_CONVO: &str = r#"
+#hide test
+- aboba
 #as test
-- test1  #{
+#if true ""
+    > test
+    -
+hello
 
 
+     \# sldkf
 
-name # i don't like your face
-
-}
-
-# !if true "checking"
-    - test 2
-
-#jump test
-"#;
+aboba    "#;
 
 fn main() {
     let Ok(convo) = Compiler::new(0usize)
@@ -505,8 +451,10 @@ fn main() {
             println!("false: {msg}", msg = d.args[0]);
             false
         })
-        .register_function("dbg", |_: &mut usize, d: &FuncData| {
-            println!("{}", d.args[0]);
+        .register_function("print", |_: &mut usize, d: &FuncData| {
+            for arg in &d.args {
+                println!("{arg}");
+            }
         })
         .register_function("name", |state: &mut usize, _: &FuncData| {
             let x = ["one", "two", "three"];
@@ -514,7 +462,7 @@ fn main() {
             *state += 1;
             r
         })
-        .compile_source_as("main", TEST_CONVO2)
+        .compile_source_as("main", TEST_CONVO)
     else {
         return;
     };

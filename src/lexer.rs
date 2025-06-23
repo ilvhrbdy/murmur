@@ -1,5 +1,11 @@
 use std::{collections::HashMap, fmt, iter::Peekable};
 
+const FUNCTION_CH: char = '#';
+const FUNCTION_ONCE_EXEC_CH: char = '!';
+const FUNCTION_COMMENT_CH: char = FUNCTION_CH;
+const RESPONSE_CH: char = '-';
+const OPTION_CH: char = '>';
+
 #[derive(Copy, Clone, Debug)]
 enum Indentation {
     Spaces(u32),
@@ -25,10 +31,10 @@ impl Indentation {
         n
     }
 
-    fn as_string(&self) -> String {
+    fn as_char(&self) -> char {
         match self {
-            Indentation::Spaces(n) => " ".repeat(*n as _),
-            Indentation::Tabs(n) => "\t".repeat(*n as _),
+            Indentation::Spaces(_) => ' ',
+            Indentation::Tabs(_) => '\t',
         }
     }
 
@@ -77,10 +83,8 @@ enum TokenKind {
         args: Vec<(Loc, String)>,
         once: bool,
     },
-    Response(String),           // `-` - npc's response phrase in conversation
-    Choice(String),             // `>` - player's option in conversation
-    PhraseContinuation(String), // phrases on newlines excluding indentation
-    IsolatedBlock(String),      // constructed on parsing stage
+    Response(String), // `-` - npc's response phrase in conversation
+    Choice(String),   // `>` - player's option in conversation
 }
 
 macro_rules! funcs_registry {
@@ -144,20 +148,22 @@ enum WordErr {
     ReachedDelimiter,
 }
 
-fn skip_comment_until(end: char, stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>) {
-    while let Some((_, ch)) = stream.peek().copied() {
+fn skip_comment_until(
+    end: char,
+    stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
+) -> Result<(), WordErr> {
+    for (_, ch) in stream {
         if ch == end {
-            let _ = stream.next();
-            break;
+            return Err(WordErr::ReachedDelimiter);
         } else if ch == '\n' {
-            break;
+            return Ok(());
         }
-
-        let _ = stream.next();
     }
+
+    Err(WordErr::EndOfStream)
 }
 
-fn skip_trash_until(
+fn skip_func_trash_until(
     end: char,
     stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
 ) -> Result<(), WordErr> {
@@ -165,8 +171,8 @@ fn skip_trash_until(
         if ch == end {
             let _ = stream.next();
             return Err(WordErr::ReachedDelimiter);
-        } else if ch == '#' {
-            skip_comment_until(end, stream);
+        } else if ch == FUNCTION_COMMENT_CH {
+            skip_comment_until(end, stream)?;
         } else if !ch.is_whitespace() {
             return Ok(());
         }
@@ -182,9 +188,12 @@ fn collect_func_until(
     end: char,
     stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
 ) -> Result<(Loc, bool, String, Vec<(Loc, String)>), WordErr> {
-    skip_trash_until(end, stream)?;
+    skip_func_trash_until(end, stream)?;
 
-    let once = stream.next_if(|(_, ch)| *ch == '!').is_some();
+    let once = stream
+        .next_if(|(_, ch)| *ch == FUNCTION_ONCE_EXEC_CH)
+        .is_some();
+
     let (fn_loc, fn_name) = collect_word_until(end, stream)?;
     let mut args = Vec::<(Loc, String)>::new();
 
@@ -203,83 +212,118 @@ fn collect_func_until(
     Ok((fn_loc, once, fn_name, args))
 }
 
+fn collect_quoted_word_into(
+    buf: &mut String,
+    stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
+) -> Result<(), WordErr> {
+    let Some((word_loc, '"')) = stream.next() else {
+        unreachable!("hey, bruh");
+    };
+
+    let mut closed = false;
+    let mut end_loc = word_loc;
+
+    while let Some((ch_loc, ch)) = stream.next() {
+        end_loc = ch_loc;
+        if ch == '"' {
+            closed = true;
+            break;
+        } else if ch == '\\' {
+            let Some((_, next_ch)) = stream.next() else {
+                break;
+            };
+            buf.push(next_ch);
+        } else if ch == '\n' {
+            buf.push(ch);
+            // trim indent
+            while stream
+                .next_if(|(_, ch)| *ch != '\n' && ch.is_whitespace())
+                .is_some()
+            {}
+        } else {
+            buf.push(ch);
+        }
+    }
+
+    if closed {
+        Ok(())
+    } else {
+        eprintln!("{end_loc} couldn't find closing '\"' for one at {word_loc}");
+        Err(WordErr::UnclosedQuotes)
+    }
+}
+
 fn collect_word_until(
     end: char,
     stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
 ) -> Result<(Loc, String), WordErr> {
-    skip_trash_until(end, stream)?;
-
-    let Some((word_loc, next_ch)) = stream.peek().copied() else {
-        return Err(WordErr::EndOfStream);
-    };
-
-    if let '"' = next_ch {
-        let mut closed = false;
-        let mut end_loc = word_loc;
-
-        let mut chars = stream.by_ref().skip(1).take_while(|(ch_loc, ch)| {
-            end_loc = *ch_loc;
-
-            let go_on = *ch != '"';
-            if !go_on {
-                closed = true;
-            }
-
-            go_on
-        });
-
-        let word = chars
-            .next()
-            .map(|(loc, ch)| {
-                // waiting for collect_into method 0_o
-                let mut word = ch.to_string();
-                word.extend(chars.map(|(_, ch)| ch));
-                (loc, word)
-            })
-            .unwrap_or((word_loc, String::new()));
-
-        return if closed {
-            Ok(word)
-        } else {
-            eprintln!("{end_loc} couldn't find closing '\"' for one at {word_loc}");
-            Err(WordErr::UnclosedQuotes)
-        };
-    }
+    skip_func_trash_until(end, stream)?;
 
     let mut word = String::new();
-    while let Some((_, ch)) = stream.next_if(|(_, ch)| !ch.is_whitespace()) {
+    let mut word_loc = None::<Loc>;
+
+    let result = loop {
+        let Some(&(loc, ch)) = stream.peek() else {
+            break Err(WordErr::EndOfStream);
+        };
+
+        if word_loc.is_none() {
+            word_loc = Some(loc);
+        }
+
         if ch == end {
-            break;
-        } else if ch == '#' {
-            skip_comment_until(end, stream);
+            break Err(WordErr::ReachedDelimiter);
+        } else if ch.is_whitespace() {
+            break Ok(());
+        } else if ch == '"' {
+            collect_quoted_word_into(&mut word, stream)?;
+            return Ok((word_loc.unwrap(), word));
+        } else if ch == '\\' {
+            let _ = stream.next();
+            let Some((_, next_ch)) = stream.next() else {
+                break Err(WordErr::EndOfStream);
+            };
+
+            word.push(next_ch);
+        } else if ch == FUNCTION_COMMENT_CH {
+            let _ = stream.next();
+            if let Err(e) = skip_comment_until(end, stream) {
+                break Err(e);
+            }
         } else {
+            let _ = stream.next();
             word.push(ch);
         }
-    }
+    };
 
     if word.is_empty() {
-        Err(WordErr::EndOfStream)
+        let Err(e) = result else {
+            unreachable!();
+        };
+
+        Err(e)
     } else {
-        Ok((word_loc, word))
+        Ok((word_loc.unwrap(), word))
     }
 }
 
-fn collect_phrase(
+fn collect_phrase_into(
+    buffer: &mut String,
     stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>,
-) -> Option<(Loc, String)> {
-    let mut phrase = String::new();
+) -> Option<Loc> {
+    while stream.next_if(|&(_, ch)| ch.is_whitespace()).is_some() {}
     let loc = stream.peek().copied().map(|(l, _)| l)?;
 
     for (_, ch) in stream {
         // NOTE: End is not trimmed, because the phrases may be combined in the future: Response/Option + PhraseContinuation
         //       So the result Option or Response in the state will most likely contains a newline, which will be removed on parsing stage
-        phrase.push(ch);
+        buffer.push(ch);
         if ch == '\n' {
             break;
         }
     }
 
-    (!phrase.is_empty()).then_some((loc, phrase))
+    Some(loc)
 }
 
 fn collect_indent(stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>) -> Option<Indentation> {
@@ -301,7 +345,7 @@ fn collect_indent(stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>) -> O
     Some(indent)
 }
 
-pub(super) fn tokenize(src: &str) -> Vec<Token> {
+pub(super) fn tokenize(module_name: &str, src: &str) -> Result<Vec<Token>, ()> {
     let mut tokens = Vec::new();
     let mut loc = Loc { line: 1, col: 1 };
 
@@ -319,21 +363,20 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
 
             it
         })
-        .skip_while(|t| t.1 == '\n') // trim start
+        .skip_while(|t| t.1 == '\n')
         .peekable();
 
     loop {
-        // TODO: this is collecting indentation for the PhraseContinuation, which i need when pointing on errors within string interpolation...
         let Some(indentation) = collect_indent(&mut stream) else {
             break;
         };
 
-        let Some((_, ch)) = stream.next() else {
+        let Some((ch_loc, ch)) = stream.next() else {
             break;
         };
 
         let token = match ch {
-            '#' if stream.peek().is_some_and(|(_, next_ch)| *next_ch != '{') => {
+            FUNCTION_CH if stream.peek().is_some_and(|(_, next_ch)| *next_ch != '{') => {
                 let Ok((fn_loc, once, fn_name, args)) = collect_func_until('\n', &mut stream)
                 else {
                     continue;
@@ -342,16 +385,19 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
                 let kind = FunctionKind::from_str(&fn_name);
                 Some((fn_loc, TokenKind::Function { kind, args, once }))
             }
-            '>' => {
-                collect_phrase(&mut stream).map(|(loc, phrase)| (loc, TokenKind::Choice(phrase)))
+            OPTION_CH => {
+                let mut phrase = String::new();
+                collect_phrase_into(&mut phrase, &mut stream)
+                    .map(|_| (ch_loc, TokenKind::Choice(phrase)))
             }
-            '-' => {
-                collect_phrase(&mut stream).map(|(loc, phrase)| (loc, TokenKind::Response(phrase)))
+            RESPONSE_CH => {
+                let mut phrase = String::new();
+                collect_phrase_into(&mut phrase, &mut stream)
+                    .map(|_| (ch_loc, TokenKind::Response(phrase)))
             }
             '\n' => {
                 if let Some(Token {
-                    kind:
-                        TokenKind::Choice(p) | TokenKind::Response(p) | TokenKind::PhraseContinuation(p),
+                    kind: TokenKind::Choice(p) | TokenKind::Response(p),
                     ..
                 }) = tokens.last_mut()
                 {
@@ -360,17 +406,32 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
 
                 continue;
             }
-            // TODO: i could push a phrase part into the last token?
-            _ => collect_phrase(&mut stream).map(|(loc, phrase)| {
-                let mut char_buf = [0u8; 4];
-                (
-                    loc,
-                    // putting indentation back, so later on string interpolation we could report correct location of an error
-                    TokenKind::PhraseContinuation(
-                        indentation.as_string() + ch.encode_utf8(&mut char_buf) + &phrase,
-                    ),
-                )
-            }),
+            _ => {
+                let Some(Token {
+                    kind: TokenKind::Choice(p) | TokenKind::Response(p),
+                    ..
+                }) = tokens.last_mut()
+                else {
+                    eprintln!(
+                        "{module_name}:{ch_loc} this text must belong to `-` response or `>` choice"
+                    );
+                    if let Err(WordErr::EndOfStream) = skip_comment_until('\n', &mut stream) {
+                        break;
+                    }
+
+                    continue;
+                };
+
+                for _ in 0..indentation.get_amount() {
+                    p.push(indentation.as_char())
+                }
+
+                p.push(ch);
+
+                let _ = collect_phrase_into(p, &mut stream);
+
+                continue;
+            }
         };
 
         let Some((loc, kind)) = token else {
@@ -384,13 +445,17 @@ pub(super) fn tokenize(src: &str) -> Vec<Token> {
         });
     }
 
-    tokens
+    Ok(tokens)
 }
 
 #[derive(Debug)]
 pub(super) enum Item {
     Nop,
     End,
+    Block {
+        guards_choices: bool,
+        next: Option<usize>, // links will hold an item after the block to be able to `#hide` them all
+    },
     Response {
         phrase: Phrase,
         choices: Vec<usize>,
@@ -421,7 +486,7 @@ pub(super) enum Item {
         func: usize,
 
         next: Option<usize>,
-        holds_choices: bool,
+        guards_choices: bool,
     },
     // Elif { condition_fn: usize },
     // Else { condition_fn: usize },
@@ -549,7 +614,7 @@ pub(super) fn parse_tokens_into_items<State>(
 
         if let Item::Choice { .. }
         | Item::If {
-            holds_choices: true,
+            guards_choices: true,
             ..
         } = parser.items[target_item]
         {
@@ -651,59 +716,30 @@ fn parse_module<State>(
     let mut parents = Vec::<Option<usize>>::new();
     let mut sibling_idx = Vec::<u32>::new();
     let mut item_depth = Vec::<u32>::new();
+    let mut item_loc = Vec::<Loc>::new();
 
     let mut module_items = Vec::<Item>::new();
-    let mut label_to_assign = None::<(u32, String)>;
+    let mut label_to_assign = None::<String>;
     let mut tokens = tokens.into_iter().peekable();
 
     while let Some(token) = tokens.next() {
         let this_item = module_items.len() + link_offset;
         let token_loc = token.loc;
 
-        if let TokenKind::PhraseContinuation(text) = token.kind {
-            if !text.trim().is_empty() {
-                fail!(
-                    "{module_name}:{token_loc} {text:?} must belong to `-` response or `>` option"
-                );
-            }
-
-            continue;
-        }
-
         let Ok(token_depth) = get_depth(token.indentation, token_loc) else {
             fail!();
             return;
         };
 
-        macro_rules! collect_whole_phrase {
-            ($input:expr) => {{
-                let mut p = $input;
-
-                while let Some(Token {
-                    kind: TokenKind::PhraseContinuation(text),
-                    ..
-                }) = tokens.peek()
-                {
-                    p.push_str(&text);
-                    let _ = tokens.next();
-                }
-
-                if let Ok(parsed_phrase) = parse_phrase((token_loc, &p), funcs_map, funcs) {
-                    parsed_phrase
-                } else {
-                    fail!();
-                    Phrase::Static(p)
-                }
-            }};
-        }
-
         macro_rules! register_state_item {
             ($update_family:expr $(, $item:expr)?) => {{
-                if let Some((.., label)) = label_to_assign.take() {
+                if let Some(label) = label_to_assign.take() {
                     let _ = labels_map.insert(label, this_item).is_some();
                 }
 
                 item_depth.push(token_depth);
+                item_loc.push(token_loc);
+
                 if $update_family {
                     let this = module_items.len();
                     welcome_to_the_family(
@@ -718,51 +754,15 @@ fn parse_module<State>(
             }};
         }
 
-        if let Some((label_depth, _)) = label_to_assign {
-            if label_depth > token_depth {
-                fail!(
-                    "{module_name}:{token_loc} label must be either a parent of next item to define a block or to be at the same indentation depth as the next item"
-                );
-                continue;
-            }
-
-            // create labeled block
-            if label_depth < token_depth {
-                let (label_depth, label) = label_to_assign.take().unwrap();
-                let mut block = vec![
-                    Token {
-                        kind: TokenKind::IsolatedBlock(label),
-                        ..token
-                    },
-                    token,
-                ];
-
-                while let Some(next_t) = tokens.peek() {
-                    let Ok(next_t_depth) = get_depth(next_t.indentation, next_t.loc) else {
-                        fail!();
-                        return;
-                    };
-
-                    if label_depth < next_t_depth {
-                        block.push(tokens.next().unwrap());
-                    } else {
-                        break;
-                    }
-                }
-
-                load_queue.push((module_name.clone(), block));
-
-                continue;
-            }
-        }
-
         match token.kind {
-            TokenKind::PhraseContinuation(_) => unreachable!(),
-            TokenKind::IsolatedBlock(label) => {
-                *labels_map.get_mut(&label).unwrap() = module_items.len() + link_offset
-            }
             TokenKind::Response(phrase) => {
-                let phrase = collect_whole_phrase!(phrase);
+                // phrase phrase phrase phrase phrase phrase
+                let phrase = parse_phrase(&module_name, (token_loc, &phrase), funcs_map, funcs)
+                    .unwrap_or_else(|_| {
+                        fail!();
+                        Phrase::Static(phrase)
+                    });
+
                 register_state_item!(
                     true,
                     Item::Response {
@@ -772,31 +772,44 @@ fn parse_module<State>(
                 );
             }
             TokenKind::Choice(phrase) => {
-                let phrase = collect_whole_phrase!(phrase);
+                let phrase = parse_phrase(&module_name, (token_loc, &phrase), funcs_map, funcs)
+                    .unwrap_or_else(|_| {
+                        fail!();
+                        Phrase::Static(phrase)
+                    });
+
                 register_state_item!(false);
 
                 let mut search_depth = item_depth[this_item];
                 let mut conditions = Vec::<usize>::new();
 
-                let handler_search_result = (0..module_items.len()).rev().find_map(|i| {
-                    if let Item::If { holds_choices, .. } = &mut module_items[i] {
-                        if token_depth <= item_depth[i] {
+                let handler_search_result = (0..module_items.len()).rev().find_map(|prev_item| {
+                    if let Item::Block { guards_choices, .. } | Item::If { guards_choices, .. } =
+                        &mut module_items[prev_item]
+                    {
+                        if token_depth < item_depth[prev_item] {
+                            return None;
+                        } else if token_depth == item_depth[prev_item] && prev_item + 1 != this_item
+                        {
+                            if !*guards_choices {
+                                return Some(Err(()));
+                            }
+
                             return None;
                         }
 
-                        *holds_choices = true;
-                        conditions.push(i);
-                        search_depth = item_depth[i];
+                        *guards_choices = true;
+                        conditions.push(prev_item);
+                        search_depth = item_depth[prev_item];
                         None
-                    } else if item_depth[i] < search_depth {
-                        println!("{phrase:?} {i}");
+                    } else if item_depth[prev_item] < search_depth {
                         Some(Err(()))
-                    } else if item_depth[i] > search_depth {
+                    } else if item_depth[prev_item] > search_depth {
                         None
-                    } else if let Item::Choice { .. } = &module_items[i] {
+                    } else if let Item::Choice { .. } = &module_items[prev_item] {
                         None
                     } else {
-                        Some(Ok(i))
+                        Some(Ok(prev_item))
                     }
                 });
 
@@ -889,7 +902,10 @@ fn parse_module<State>(
                                 }
                             };
 
-                            let import_tokens = tokenize(&src);
+                            let Ok(import_tokens) = tokenize(import_name, &src) else {
+                                fail!();
+                                continue;
+                            };
 
                             load_queue.push((import_name.to_string(), import_tokens));
                             *is_loaded = true;
@@ -969,10 +985,27 @@ fn parse_module<State>(
                     fail!("{module_name}:{label_loc} duplicate label `{label}`");
                 }
 
-                label_to_assign = Some((token_depth, name.clone()));
-                // register label just to be able to catch redefinition
-                // later items will assign their indices to the label
-                labels_map.insert(name, 0);
+                let Some(next_t) = tokens.peek() else {
+                    fail!("{module_name}:{token_loc} `{kind}` label doesn't belong to any item");
+                    continue;
+                };
+
+                let Ok(next_t_depth) = get_depth(next_t.indentation, next_t.loc) else {
+                    fail!();
+                    return;
+                };
+
+                label_to_assign = Some(name);
+
+                if next_t_depth > token_depth {
+                    register_state_item!(
+                        true,
+                        Item::Block {
+                            guards_choices: false,
+                            next: None
+                        }
+                    );
+                }
             }
             TokenKind::Function {
                 kind: kind @ FunctionKind::Import,
@@ -1091,17 +1124,25 @@ fn parse_module<State>(
                     continue;
                 };
 
-                let Ok(next_t_depth) = get_depth(next_t.indentation, next_t.loc) else {
-                    fail!();
-                    return;
-                };
+                let guards_choices = matches!(
+                    next_t,
+                    Token {
+                        kind: TokenKind::Choice(_),
+                        ..
+                    }
+                );
 
-                if next_t_depth == token_depth {
-                    fail!(
-                        "{module_name}:{token_loc} `{kind}` must hold at least one item indented under it"
-                    );
-                    continue;
-                }
+                // let Ok(next_t_depth) = get_depth(next_t.indentation, next_t.loc) else {
+                //     fail!();
+                //     return;
+                // };
+
+                // if next_t_depth == token_depth {
+                //     fail!(
+                //         "{module_name}:{token_loc} `{kind}` must hold at least one item indented under it"
+                //     );
+                //     continue;
+                // }
 
                 let args = args
                     .into_iter()
@@ -1118,7 +1159,7 @@ fn parse_module<State>(
                 register_state_item!(
                     true,
                     Item::If {
-                        holds_choices: false,
+                        guards_choices,
                         func,
                         func_data,
                         next: None,
@@ -1144,6 +1185,35 @@ fn parse_module<State>(
                 };
 
                 register_state_item!(true, Item::FunctionCall { func, func_data })
+            }
+        }
+    }
+
+    let items_len = module_items.len();
+    for this_item in 0..items_len {
+        let (Item::Block {
+            guards_choices: true,
+            ..
+        }
+        | Item::If {
+            guards_choices: true,
+            ..
+        }) = &module_items[this_item]
+        else {
+            continue;
+        };
+
+        for next_item in this_item + 1..items_len {
+            if item_depth[next_item] <= item_depth[this_item] {
+                break;
+            }
+
+            if !matches!(&module_items[next_item], Item::Choice { .. }) {
+                fail!(
+                    "{module_name}:{loc} block that starts with choice at {block_start_loc} must hold only choices",
+                    loc = item_loc[next_item],
+                    block_start_loc = item_loc[this_item + 1]
+                );
             }
         }
     }
@@ -1222,6 +1292,7 @@ pub(crate) enum PhraseParts {
 }
 
 fn parse_phrase<State>(
+    module_name: &str,
     (mut phrase_loc, input): (Loc, &str),
     funcs_map: &HashMap<&'static str, usize>,
     funcs: &[Function<State>],
@@ -1239,8 +1310,7 @@ fn parse_phrase<State>(
                     loc.col += 1;
                     t
                 })
-                .skip_while(|(_, ch)| *ch != '\n' && ch.is_whitespace())
-                .skip_while(|(_, ch)| *ch == '\\');
+                .skip_while(|&(_, ch)| ch != '\n' && ch.is_whitespace());
 
             phrase_loc.line += 1;
             phrase_loc.col = 1;
@@ -1251,7 +1321,14 @@ fn parse_phrase<State>(
 
     let mut buf = String::new();
     while let Some((_, ch)) = stream.next() {
-        if ch != '#' {
+        if ch == '\\' {
+            let Some((_, next_ch)) = stream.next() else {
+                break;
+            };
+
+            buf.push(next_ch);
+            continue;
+        } else if ch != FUNCTION_CH {
             buf.push(ch);
             continue;
         }
@@ -1278,11 +1355,11 @@ fn parse_phrase<State>(
         let (func_loc, once, fn_name, args) = match collect_func_until('}', &mut stream) {
             Ok(f) => f,
             Err(WordErr::EndOfStream) => {
-                eprintln!("{next_ch_loc} could not find '}}' closing delimiter");
+                eprintln!("{module_name}:{next_ch_loc} could not find '}}' closing delimiter");
                 return Err(());
             }
             Err(WordErr::ReachedDelimiter) => {
-                eprintln!("{next_ch_loc} expected function name within `@{{}}`");
+                eprintln!("{module_name}:{next_ch_loc} expected function name within `@{{}}`");
                 return Err(());
             }
             Err(WordErr::UnclosedQuotes) => return Err(()),
@@ -1387,7 +1464,7 @@ fn func_signature_is_valid<'s>(
 fn link_state_items(
     link_offset: usize,
     items: &mut [Item],
-    items_depth: &[u32],
+    item_depth: &[u32],
     parents: &[Option<usize>],
     sibling_idx: &[u32],
 ) -> Vec<Option<usize>> {
@@ -1398,79 +1475,31 @@ fn link_state_items(
     for item in 0..items_len {
         if let Item::Choice { .. }
         | Item::End
+        | Item::Block {
+            guards_choices: true,
+            ..
+        }
         | Item::If {
-            holds_choices: true,
+            guards_choices: true,
             ..
         } = &items[item]
         {
             continue;
         }
 
-        // if let Some((
-        //     Some(Item::If {
-        //         next,
-        //         holds_choices,
-        //         ..
-        //     }),
-        //     other_items,
-        // )) = items
-        //     .split_at_mut_checked(item + 1)
-        //     .map(|(left, right)| (left.last_mut(), right))
-        // {
-        //     let if_depth = items_depth[item];
-        //     let offset = item + 1;
-
-        //     *next = (0..other_items.len())
-        //         .find_map(|i| {
-        //             let next_item = offset + i;
-        //             let next_item_depth = items_depth[next_item];
-
-        //             if if_depth < next_item_depth {
-        //                 None
-        //             } else if if_depth > next_item_depth {
-        //                 Some(Err(()))
-        //             } else {
-        //                 Some(Ok(next_item))
-        //             }
-        //         })
-        //         .and_then(|res| res.ok());
-
-        //     if *holds_choices {
-        //         continue;
-        //     }
-
-        // TODO:
-        // for (item, kind) in items.iter().enumerate() {
-        //     if let Item::If {
-        //         holds_choices: true,
-        //         fallback,
-        //         ..
-        //     } = &mut module_items[item]
-        //     {
-        //         let until = fallback.unwrap_or(module_items.len());
-        //         if module_items[item + 1..until]
-        //             .iter()
-        //             .any(|i| !matches!(i, Item::Choice { .. }))
-        //         {
-        //             // TODO: loc vector for all pushed items maybe
-        //             fail!("{module_name}: this `if` holds choices, so cannot hold any other item kinds but choices");
-        //         }
-        //     }
-        // }
-        // }
-
         // link previous item with this state item
         if let Some(prev_item) = item
             .checked_sub(1)
             .filter(|prev_item| !matches!(items[*prev_item], Item::End))
         {
-            let link = if let Item::If { next, .. } = &mut items[prev_item] {
-                next
-            } else if let link @ None = &mut links[prev_item] {
-                link
-            } else {
-                continue;
-            };
+            let link =
+                if let Item::If { next, .. } | Item::Block { next, .. } = &mut items[prev_item] {
+                    next
+                } else if let link @ None = &mut links[prev_item] {
+                    link
+                } else {
+                    continue;
+                };
 
             *link = Some(item + link_offset);
         }
@@ -1478,20 +1507,18 @@ fn link_state_items(
         states.push(item);
     }
 
-    // let items_len = items.len();
-    // let states_len = states.len();
-
     for i in 0..states.len() {
         let this_state = states[i];
 
-        let maybe_options = match &items[this_state] {
-            Item::Response { choices, .. } => Some(choices),
-            Item::If { .. }
+        let (states_search_range, maybe_options) = match &items[this_state] {
+            Item::Response { choices, .. } => (&states[i..], Some(choices)),
+            Item::If { .. } => (&states[i + 1..], None),
+            Item::Block { .. }
             | Item::Nop
             | Item::FunctionCall { .. }
             | Item::Jump { .. }
             | Item::Hide { .. }
-            | Item::Show { .. } => None,
+            | Item::Show { .. } => (&states[i..], None),
             Item::End | Item::Choice { .. } => unreachable!(),
         };
 
@@ -1502,11 +1529,18 @@ fn link_state_items(
             continue;
         }
 
-        let found_next_item =
-            find_next_state_long_long_way(&states[i..], parents, sibling_idx, items_depth)
-                .map(|item_idx| item_idx + link_offset);
+        let found_next_item = find_next_state_long_long_way(
+            this_state,
+            states_search_range,
+            parents,
+            sibling_idx,
+            item_depth,
+        )
+        .map(|item_idx| item_idx + link_offset);
 
-        links[this_state] = found_next_item;
+        if let link @ None = &mut links[this_state] {
+            *link = found_next_item;
+        }
 
         let Some(options) = maybe_options else {
             continue;
@@ -1594,13 +1628,12 @@ fn welcome_to_the_family(
 }
 
 fn find_next_state_long_long_way(
+    mut current: usize,
     states: &[usize],
     parents: &[Option<usize>],
     sibling_idx: &[u32],
     item_depth: &[u32],
 ) -> Option<usize> {
-    let mut current = states.first().copied()?;
-
     loop {
         'searching: for state in states.iter().skip(1) {
             if item_depth[current] != item_depth[*state] {
