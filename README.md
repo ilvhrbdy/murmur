@@ -177,7 +177,25 @@ Will disable/enable the specified items, causing them to be skipped. If no label
 #show where how_much
 #jump useful_convo
 ```
-By indenting 
+By indenting items under `#if` label you create a group of items that can be hidden together:
+```
+#hide label
+#as label # this whole block will be skipped
+    - one
+    - two
+    - three
+
+```
+A block can have two types: normal, like previous one and "choices guard". The first item defined in the block determines its type. A choices guard cannot hold anything other than choices.
+```
+- lasdkafjlaskdjf
+#as optional_choices # these choices can be hidden
+    > once
+    > two
+    ## '- some response' for example, in this context, is not allowed
+## this guy will always be included
+> three
+```
 
 #### `#end`
 Immediately ends the conversation. Cannot call it with `!`, obviously..
