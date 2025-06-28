@@ -1,10 +1,12 @@
 mod lexer;
 mod utils;
 
-use lexer::{FuncData, Function, Item, Phrase};
+use lexer::{Condition, Context, Function, Item, ItemVIsibility, Phrase};
 use std::collections::HashMap;
 use std::path::Path;
-
+// TODO: vec of errors (just strings) instead of printing to stdout
+// TODO: be able to laod multiple sources from files or memory and compile as different sources, just because it is cool
+// TODO: snapshots of the conversation with/without external state
 // TODO: when reporting errors use full path
 // TODO: need to do something with cases like this:
 //
@@ -33,102 +35,75 @@ use std::path::Path;
 // TODO: write tests, please?
 // TODO: normal error messages
 
-// only to shut the linter, see no point in having error types anyway in our case
 pub enum Error {
     ReadingInputFile,
     ParsingSource,
 }
 
-pub struct Compiler<ExternalState> {
-    funcs_map: HashMap<&'static str, Function<ExternalState>>,
-    state: ExternalState,
+pub enum FunctionMapError {
+    FunctionExist,
+    DiffersReturnType,
 }
 
-impl<ExternalState> Compiler<ExternalState> {
-    pub fn new(state: ExternalState) -> Self {
-        Self {
-            state,
-            funcs_map: HashMap::new(),
-        }
-    }
+#[derive(Default)]
+pub struct FunctionMap<ExternalState> {
+    pub(crate) indices: HashMap<&'static str, usize>,
+    pub(crate) funcs: Vec<Function<ExternalState>>,
+}
 
-    pub fn register_function<T>(
-        mut self,
+impl<ExternalState> FunctionMap<ExternalState> {
+    pub fn replace<T>(
+        &mut self,
         name: &'static str,
         f: impl lexer::IntoFunction<ExternalState, T>,
-    ) -> Self {
-        self.funcs_map.insert(name, f.into_function());
-        self
-    }
-
-    pub fn compile_source_as(
-        self,
-        module_name: impl AsRef<str>,
-        source: impl AsRef<str>,
-    ) -> Result<Conversation<ExternalState>, Error> {
-        let module_name = module_name.as_ref();
-        let Ok(tokens) = lexer::tokenize(module_name, source.as_ref()) else {
-            return Err(Error::ParsingSource);
+    ) -> Result<(), FunctionMapError> {
+        let Some(existing_ftype) = &self.indices.get(name).map(|idx| &self.funcs[*idx]) else {
+            return self.register(name, f)
         };
 
-        let Ok((items, links, funcs)) =
-            lexer::parse_tokens_into_items(module_name, tokens, self.funcs_map)
-        else {
-            return Err(Error::ParsingSource);
-        };
+        let ftype = f.into_function();
 
-        let (current, next) = if items.is_empty() {
-            (None, None)
+        if let (Function::Bool(_), Function::Bool(_))
+            | (Function::Nothing(_), Function::Nothing(_))
+            | (Function::String(_), Function::String(_))  = (&ftype, existing_ftype) {
+                self.register::<T>(name, ftype)
         } else {
-            (Some(0), Some(0))
-        };
-
-        let mut it = Conversation {
-            state: self.state,
-            funcs,
-            _if_checkes_buffer: HashMap::new(),
-            vis: vec![true; items.len()],
-            current,
-            next,
-            items,
-            links,
-        };
-
-        it.next_state();
-
-        Ok(it)
+            Err(FunctionMapError::DiffersReturnType)
+        }
     }
+    pub fn register<T>(
+        &mut self,
+        name: &'static str,
+        f: impl lexer::IntoFunction<ExternalState, T>,
+    ) -> Result<(), FunctionMapError> {
+        if lexer::FunctionKind::BUILTINS_STR.contains(&name) || self.indices.contains_key(&name) {
+            return Err(FunctionMapError::FunctionExist);
+        }
 
-    pub fn compile(self, path: impl AsRef<Path>) -> Result<Conversation<ExternalState>, Error> {
-        let path = path.as_ref();
-        let file_name = path.file_name().unwrap().to_str().unwrap();
-        let module_name = file_name.strip_suffix(".mur").unwrap_or(file_name);
-        let src = utils::read_mur_file(path).map_err(|e| {
-            eprintln!("failed to load file: {e}");
-            Error::ReadingInputFile
-        })?;
+        self.indices.insert(name, self.funcs.len());
+        self.funcs.push(f.into_function());
 
-        self.compile_source_as(module_name, src)
+        Ok(())
     }
 }
 
 pub struct State<'s> {
-    vis: &'s [bool],
     items: &'s [Item],
+    choices: &'s [usize],
     current: usize,
 }
 
 impl<'s> State<'s> {
     pub fn response(&self) -> Option<&str> {
         let Item::Response { phrase, .. } = &self.items[self.current] else {
-            unreachable!("{:?}", &self.items[self.current]);
+            unreachable!();
         };
 
         phrase.as_nonempty_str()
     }
 
     pub fn choices(&self) -> impl Iterator<Item = &str> {
-        self.choice_indices().map(|ch| {
+        self.choices.iter().map(|&ch| {
             let Item::Choice { phrase, .. } = &self.items[ch] else {
                 unreachable!()
             };
@@ -138,123 +113,147 @@ impl<'s> State<'s> {
             buffer.as_str()
         })
     }
-
-    fn choice_indices(&self) -> impl Iterator<Item = usize> {
-        let Item::Response { choices, .. } = &self.items[self.current] else {
-            unreachable!();
-        };
-
-        choices
-            .iter()
-            .filter(|&&ch| {
-                let Item::Choice { display, .. } = &self.items[ch] else {
-                    unreachable!()
-                };
-
-                self.vis[ch] && *display
-            })
-            .copied()
-    }
 }
 
-pub struct Conversation<ExternalState> {
-    state: ExternalState,
-    funcs: Vec<Function<ExternalState>>,
+pub struct Conversation<'a, ExternalState> {
+    funcs_map: &'a FunctionMap<ExternalState>,
 
-    _if_checkes_buffer: HashMap<usize, bool>,
-    vis: Vec<bool>,
+    choices_to_display: Vec<usize>,
+
+    vis: Vec<ItemVIsibility>,
     items: Vec<Item>,
     links: Vec<Option<usize>>,
 
     current: Option<usize>,
     next: Option<usize>,
+
+    choice: Option<usize>,
 }
 
-impl<ExternalState> Conversation<ExternalState> {
-    pub fn next_state(&mut self) -> bool {
+impl<'a, ExternalState> Conversation<'a, ExternalState> {
+    pub fn compile_from_source_as(
+        module_name: impl AsRef<str>,
+        source: impl AsRef<str>,
+        funcs_map: &'a FunctionMap<ExternalState>,
+    ) -> Result<Conversation<'a, ExternalState>, Error> {
+        let module_name = module_name.as_ref();
+        let Ok(tokens) = lexer::tokenize(module_name, source.as_ref()) else {
+            return Err(Error::ParsingSource);
+        };
+
+        let Ok((items, vis, links)) =
+            lexer::parse_tokens_into_items(module_name, tokens, funcs_map)
+        else {
+            return Err(Error::ParsingSource);
+        };
+
+        Ok(Conversation {
+            funcs_map,
+            choices_to_display: Vec::new(),
+            vis,
+            current: None,
+            choice: None,
+            next: (!items.is_empty()).then_some(0),
+            items,
+            links,
+        })
+    }
+
+    pub fn compile(
+        path: impl AsRef<Path>,
+        funcs_map: &'a FunctionMap<ExternalState>,
+    ) -> Result<Conversation<'a, ExternalState>, Error> {
+        let path = path.as_ref();
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        let module_name = file_name.strip_suffix(".mur").unwrap_or(file_name);
+        let src = utils::read_mur_file(path).map_err(|e| {
+            eprintln!("failed to load file: {e}");
+            Error::ReadingInputFile
+        })?;
+
+        Self::compile_from_source_as(module_name, src, funcs_map)
+    }
+
+    pub fn next_state(&mut self, external_state: &mut ExternalState) -> bool {
+        if let Some(choice_idx) = self.choice.take() {
+            self.next = self.links[self.choices_to_display[choice_idx]];
+        }
+
         self.current = loop {
             let Some(current) = self.next else {
                 break None;
             };
+
+            let visible = {
+                let vis = &mut self.vis[current];
+                !matches!(vis.condition, Condition::AlwaysHidden) || vis.manual
+            };
+
+            if !visible {
+                self.next = self.links[current];
+                continue;
+            } else if let Condition::Check(..) = &self.vis[current].condition {
+                self.next = self.next_state_from_condition_chain(current, external_state);
+                continue;
+            }
 
             let Some(item) = self.items.get_mut(current) else {
                 break None;
             };
 
             match item {
-                _ if !self.vis[current] => self.next = self.links[current],
-                Item::Nop => self.next = self.links[current],
-                Item::Block { next, .. } => {
-                    self.next = *next;
-                }
                 Item::Response { .. } => {
-                    self.update_phrases_in_state(current);
+                    self.prepare_state(current, external_state);
                     self.next = self.links[current];
                     break Some(current);
                 }
-                Item::If {
-                    func,
-                    func_data,
+                Item::Block {
                     next,
+                    guarded_choices,
                     ..
                 } => {
-                    let Function::Bool(f) = &self.funcs[*func] else {
-                        unreachable!();
-                    };
-
-                    let passed = f(&mut self.state, func_data);
-
-                    let next = if passed { *next } else { self.links[current] };
-
-                    self.next = next;
-
-                    if func_data.once {
-                        *item = Item::Nop;
-                        if passed {
-                            self.links[current] = next;
-                        }
-                    }
+                    assert!(guarded_choices.is_none());
+                    self.next = *next;
                 }
                 Item::End => {
-                    self.current = None;
                     self.next = None;
-                    return false;
+                    break None;
                 }
                 Item::Show { targets, once } => {
                     for item in targets {
-                        self.vis[*item] = true;
+                        self.vis[*item].manual = true;
                     }
 
                     self.next = self.links[current];
 
                     if *once {
-                        *item = Item::Nop
+                        self.vis[current].condition = Condition::AlwaysHidden;
                     }
                 }
                 Item::Hide { targets, once } => {
                     for item in targets {
-                        self.vis[*item] = false;
+                        self.vis[*item].manual = false;
                     }
 
                     self.next = self.links[current];
 
                     if *once {
-                        *item = Item::Nop
+                        self.vis[current].condition = Condition::AlwaysHidden;
                     }
                 }
                 Item::Jump { target, once } => {
                     self.next = Some(*target);
 
                     if *once {
-                        *item = Item::Nop
+                        self.vis[current].condition = Condition::AlwaysHidden;
                     }
                 }
                 Item::FunctionCall { func, func_data } => {
-                    self.funcs[*func].call_drop(&mut self.state, func_data);
+                    self.funcs_map.funcs[*func].call_drop(func_data.as_context(external_state));
                     self.next = self.links[current];
 
                     if func_data.once {
-                        *item = Item::Nop
+                        self.vis[current].condition = Condition::AlwaysHidden;
                     }
                 }
                 Item::Choice { .. } => unreachable!(),
@@ -264,126 +263,210 @@ impl<ExternalState> Conversation<ExternalState> {
         self.current.is_some()
     }
 
-    pub fn next_state_from_choice(&mut self, option_idx: usize) -> Option<bool> {
-        let Some(current) = self.current else {
-            return Some(false);
-        };
+    pub fn select_choice(&mut self, choice: usize) -> bool {
+        if self.choices_to_display.get(choice).is_some() {
+            self.choice = Some(choice);
+            return true;
+        }
 
-        let Item::Response { choices, .. } = &self.items[current] else {
-            unreachable!();
-        };
-
-        let choice = choices.iter().filter(|&&ch| self.vis[ch]).nth(option_idx)?;
-
-        self.next = self.links[*choice];
-
-        Some(self.next_state())
+        true
     }
 
     pub fn current_state<'s>(&'s self) -> Option<State<'s>> {
         self.current.map(|current| State {
-            vis: &self.vis,
             items: &self.items,
+            choices: &self.choices_to_display,
             current,
         })
     }
 
-    fn update_phrases_in_state(&mut self, state: usize) {
-        let Some((left, right)) = self.items.split_at_mut_checked(state + 1) else {
-            return;
-        };
+    fn next_state_from_condition_chain(
+        &mut self,
+        chain_start: usize,
+        external_state: &mut ExternalState,
+    ) -> Option<usize> {
+        let mut current_check = Some(chain_start);
 
-        let Some(Item::Response { choices, phrase }) = left.last_mut() else {
+        macro_rules! return_next {
+            ($next:expr) => {{
+                let next_state = $next?;
+                return if let Item::Block { next, .. } = &self.items[next_state] {
+                    *next
+                } else {
+                    $next
+                };
+            }};
+        }
+
+        while let Some(check) = current_check.take() {
+            let this_vis = &mut self.vis[check];
+
+            let (passed, once, fallback) = if let Condition::Check(
+                func,
+                func_data,
+                fallback_condition,
+            ) = &this_vis.condition
+            {
+                if !this_vis.manual {
+                    current_check = *fallback_condition;
+                    continue;
+                }
+
+                let Function::Bool(check) = &self.funcs_map.funcs[*func] else {
+                    unreachable!();
+                };
+
+                (
+                    check(func_data.as_context(external_state)),
+                    func_data.once,
+                    *fallback_condition,
+                )
+            } else if let Condition::AlwaysHidden = &this_vis.condition {
+                break;
+            } else {
+                if this_vis.manual {
+                    return_next!(Some(check));
+                }
+
+                break;
+            };
+
+            if once {
+                self.vis[check].condition = if passed {
+                    Condition::AlwaysShown
+                } else {
+                    Condition::AlwaysHidden
+                };
+            }
+
+            if passed {
+                return_next!(Some(check));
+            } else {
+                current_check = fallback;
+            }
+        }
+
+        return_next!(self.links[current_check?])
+    }
+
+    fn prepare_state(&mut self, state: usize, external_state: &mut ExternalState) {
+        let Item::Response { choices, .. } = &self.items[state] else {
             unreachable!();
         };
 
-        phrase.update(&self.funcs, &mut self.state);
+        self.choices_to_display.clear();
+        update_choices_list_from(
+            choices,
+            external_state,
+            &mut self.choices_to_display,
+            &mut self.vis,
+            &self.items,
+            &self.funcs_map.funcs,
+        );
 
-        let offset = state + 1;
-
-        self._if_checkes_buffer.clear();
-        for c in choices.iter() {
-            let choice = *c - offset;
-
-            if !self.vis[choice] {
-                continue;
-            }
-
-            let (
-                conds,
-                [
-                    Item::Choice {
-                        conditions,
-                        phrase,
-                        display,
-                    },
-                    ..,
-                ],
-            ) = right.split_at_mut_checked(choice).unwrap()
+        for &item in std::iter::once(&state).chain(self.choices_to_display.iter()) {
+            let (Item::Choice { phrase } | Item::Response { phrase, .. }) = &mut self.items[item]
             else {
                 unreachable!();
             };
 
-            // reversing conditions because we pushed them on parsing stage in the wrong order
-            let all_passed = conditions.iter().rev().all(|&cond_item| {
-                if !self.vis[cond_item] {
-                    return false;
+            phrase.update(&self.funcs_map.funcs, external_state);
+        }
+    }
+}
+
+// function is recursive and the borrow checker makes me nervous
+fn update_choices_list_from<State>(
+    choices: &[usize],
+    state: &mut State,
+    choices_buff: &mut Vec<usize>,
+    vis: &mut [ItemVIsibility],
+    items: &[Item],
+    funcs: &[Function<State>],
+) {
+    'choices_loop: for &choice in choices {
+        let mut current_check = Some(choice);
+
+        while let Some(check) = current_check.take() {
+            let this_vis = &mut vis[check];
+
+            macro_rules! push_choices {
+                () => {{
+                    match &items[check] {
+                        Item::Choice { .. } => choices_buff.push(check),
+                        Item::Block {
+                            guarded_choices, ..
+                        } => update_choices_list_from(
+                            guarded_choices.as_ref().unwrap(),
+                            state,
+                            choices_buff,
+                            vis,
+                            items,
+                            funcs,
+                        ),
+                        _ => unreachable!(),
+                    }
+                }};
+            }
+
+            let (passed, once, fallback) = if let Condition::Check(
+                func,
+                func_data,
+                fallback_condition,
+            ) = &this_vis.condition
+            {
+                if !this_vis.manual {
+                    current_check = *fallback_condition;
+                    continue;
                 }
 
-                let cond_with_offset = cond_item - offset;
-                let (passed, once, next) = {
-                    let Item::If {
-                        func,
-                        func_data,
-                        next,
-                        ..
-                    } = (match &mut conds[cond_with_offset] {
-                        Item::Block { .. } => return true,
-                        it => it,
-                    })
-                    else {
-                        unreachable!();
-                    };
-
-                    if let Some(check_result) = self._if_checkes_buffer.get(&cond_item) {
-                        return *check_result;
-                    }
-
-                    let Function::Bool(f) = &self.funcs[*func] else {
-                        unreachable!();
-                    };
-
-                    let passed = f(&mut self.state, func_data);
-                    assert!(self._if_checkes_buffer.insert(cond_item, passed).is_none());
-
-                    (passed, func_data.once, *next)
+                let Function::Bool(f) = &funcs[*func] else {
+                    unreachable!();
                 };
 
-                if once {
-                    conds[cond_with_offset] = Item::Nop;
-                    if passed {
-                        self.links[cond_item] = next;
-                    }
+                (
+                    f(func_data.as_context(state)),
+                    func_data.once,
+                    *fallback_condition,
+                )
+            } else if let Condition::AlwaysHidden = this_vis.condition {
+                continue 'choices_loop;
+            } else {
+                if this_vis.manual {
+                    push_choices!();
                 }
 
-                passed
-            });
+                continue 'choices_loop;
+            };
 
-            *display = all_passed;
-            if all_passed {
-                phrase.update(&self.funcs, &mut self.state);
+            if once {
+                this_vis.condition = if passed {
+                    Condition::AlwaysShown
+                } else {
+                    Condition::AlwaysHidden
+                };
+            }
+
+            if passed {
+                push_choices!();
+            } else {
+                current_check = fallback;
             }
         }
     }
 }
 
-fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
+fn run<ExternalState>(
+    mut conv: Conversation<ExternalState>,
+    mut state: ExternalState,
+) -> std::io::Result<()> {
     use std::io::Write;
 
     let out = &mut std::io::stdout();
     let mut input = String::new();
 
-    while let Some(state) = conv.current_state() {
+    while conv.next_state(&mut state) {
+        let state = conv.current_state().unwrap();
         let current = state.current;
 
         write!(out, "- ")?;
@@ -397,7 +480,7 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
             None => writeln!(out, "End]")?,
         }
 
-        for (i, (phrase, ch)) in state.choices().zip(state.choice_indices()).enumerate() {
+        for (i, (phrase, &ch)) in state.choices().zip(state.choices).enumerate() {
             write!(out, "({i}) > {phrase:?} [{ch} -> ")?;
             match &conv.links[ch] {
                 Some(next) => writeln!(out, "{next}]")?,
@@ -407,66 +490,81 @@ fn run<State: Clone>(mut conv: Conversation<State>) -> std::io::Result<()> {
 
         out.flush()?;
 
-        let continuing = loop {
+        loop {
             input.clear();
             std::io::stdin().read_line(&mut input)?;
             let input = input.trim();
 
-            if let Ok(opt_idx) = input.parse::<usize>() {
-                break conv.next_state_from_choice(opt_idx).unwrap();
-            } else if input.is_empty() {
-                break conv.next_state();
+            if input.is_empty() {
+                break;
+            } else if let Ok(choice_idx) = input.parse::<usize>() {
+                if conv.select_choice(choice_idx) {
+                    break;
+                } else {
+                    continue;
+                }
             };
-        };
-
-        if !continuing {
-            break;
         }
     }
 
     Ok(())
 }
 
-const TEST_CONVO: &str = r#"
-#hide test
-- aboba
+// TODO: this shit doesn't work
+const TEST_CONVO: &str = r#" 
+#hide test aboba test2
+
+- one
+
+#as aboba
+#if true 1
+> two
+
 #as test
-#if true ""
-    > test
-    -
-hello
+#elif true 2
+    > three
+    > three2
 
-
-     \# sldkf
-
-aboba    "#;
+#as test2
+#else
+> four
+"#;
 
 fn main() {
-    let Ok(convo) = Compiler::new(0usize)
-        .register_function("true", |_: &mut usize, d: &FuncData| {
-            println!("true: {msg}", msg = d.args[0]);
-            true
-        })
-        .register_function("false", |_: &mut usize, d: &FuncData| {
-            println!("false: {msg}", msg = d.args[0]);
-            false
-        })
-        .register_function("print", |_: &mut usize, d: &FuncData| {
-            for arg in &d.args {
-                println!("{arg}");
-            }
-        })
-        .register_function("name", |state: &mut usize, _: &FuncData| {
-            let x = ["one", "two", "three"];
-            let r = x[*state].to_string();
-            *state += 1;
-            r
-        })
-        .compile_source_as("main", TEST_CONVO)
-    else {
+    let mut fs = FunctionMap::default();
+
+    let _ = fs.register("true", |ctx: Context<usize>| {
+        println!("true: {msg}", msg = ctx.args[0]);
+        true
+    });
+
+    let _ = fs.register("false", |ctx: Context<usize>| {
+        println!("false: {msg}", msg = ctx.args[0]);
+        false
+    });
+
+    let _ = fs.register("print", |ctx: Context<usize>| {
+        for arg in ctx.args {
+            print!("{arg}");
+        }
+        println!();
+    });
+
+    let _ = fs.register("name", |ctx: Context<usize>| {
+        let x = ["one", "two", "three"];
+        let r = x[*ctx.state].to_string();
+        *ctx.state += 1;
+        r
+    });
+
+    let Ok(conv) = Conversation::compile_from_source_as("main", TEST_CONVO, &fs) else {
         return;
     };
 
-    // panic!("{:#?}\n{:#?}", convo.items, convo.links);
-    run(convo).unwrap();
+    // let Ok(_conv2) = Conversation::compile("test.mur", &fs) else {
+    //     return;
+    // };
+
+    // panic!("{:#?}\n{:#?}\n{:#?}", convo.items, convo.links, convo.vis);
+    run(conv, 0usize).unwrap();
 }

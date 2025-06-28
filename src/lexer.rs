@@ -1,66 +1,46 @@
+use crate::FunctionMap;
 use std::{collections::HashMap, fmt, iter::Peekable};
 
-const FUNCTION_CH: char = '#';
-const FUNCTION_ONCE_EXEC_CH: char = '!';
-const FUNCTION_COMMENT_CH: char = FUNCTION_CH;
-const RESPONSE_CH: char = '-';
-const OPTION_CH: char = '>';
+const FUNCTION_CHAR: char = '#';
+const FUNCTION_ONCE_EXEC_CHAR: char = '!';
+const FUNCTION_COMMENT_CHAR: char = FUNCTION_CHAR;
+const RESPONSE_CHAR: char = '-';
+const OPTION_CHAR: char = '>';
+
+const TAB: char = '\t';
+const SPACE: char = ' ';
 
 #[derive(Copy, Clone, Debug)]
-enum Indentation {
-    Spaces(u32),
-    Tabs(u32),
+struct Indentation {
+    kind: char,
+    depth: u32,
 }
 
 impl Indentation {
     fn empty() -> Self {
-        Indentation::Spaces(0)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.get_amount() == 0
-    }
-
-    fn get_amount(&self) -> u32 {
-        let (Indentation::Tabs(n) | Indentation::Spaces(n)) = self;
-        *n
-    }
-
-    fn get_mut_amount(&mut self) -> &mut u32 {
-        let (Indentation::Tabs(n) | Indentation::Spaces(n)) = self;
-        n
-    }
-
-    fn as_char(&self) -> char {
-        match self {
-            Indentation::Spaces(_) => ' ',
-            Indentation::Tabs(_) => '\t',
+        Self {
+            kind: SPACE,
+            depth: 0,
         }
     }
 
     fn as_str_name(&self) -> &str {
-        match self {
-            Indentation::Spaces(n) => {
-                if *n != 0 && *n > 1 {
-                    "spaces"
-                } else {
-                    "space"
-                }
-            }
-            Indentation::Tabs(n) => {
-                if *n != 0 && *n > 1 {
-                    "tabs"
-                } else {
-                    "tab"
-                }
-            }
+        match self.kind {
+            SPACE if self.depth > 1 => "spaces",
+            SPACE => "space",
+            TAB if self.depth > 1 => "tabs",
+            TAB => "tab",
+            _ => unreachable!(),
         }
     }
 }
 
 impl Default for Indentation {
     fn default() -> Self {
-        Self::empty()
+        Self {
+            kind: SPACE,
+            depth: 4,
+        }
     }
 }
 
@@ -85,6 +65,7 @@ enum TokenKind {
     },
     Response(String), // `-` - npc's response phrase in conversation
     Choice(String),   // `>` - player's option in conversation
+    Comment,
 }
 
 macro_rules! funcs_registry {
@@ -92,14 +73,14 @@ macro_rules! funcs_registry {
         $( $builtin:ident = $builtin_str:expr, )*
     ) => {
         #[derive(Debug, Clone)]
-        enum FunctionKind {
+        pub(super) enum FunctionKind {
             $( $builtin ,)*
             Custom(String),
         }
 
         impl FunctionKind {
             const BUILTINS: &[FunctionKind] = &[$( FunctionKind::$builtin, )*];
-            const BUILTINS_STR: &[&str] = &[$( $builtin_str, )*];
+            pub(super) const BUILTINS_STR: &[&str] = &[$( $builtin_str, )*];
 
             fn from_str(this: &str) -> Self {
                 Self::BUILTINS_STR
@@ -133,6 +114,8 @@ funcs_registry!(
     Show = "show",
     Import = "import",
     If = "if",
+    Elif = "elif",
+    Else = "else",
 );
 
 #[derive(Debug)]
@@ -171,7 +154,7 @@ fn skip_func_trash_until(
         if ch == end {
             let _ = stream.next();
             return Err(WordErr::ReachedDelimiter);
-        } else if ch == FUNCTION_COMMENT_CH {
+        } else if ch == FUNCTION_COMMENT_CHAR {
             skip_comment_until(end, stream)?;
         } else if !ch.is_whitespace() {
             return Ok(());
@@ -191,7 +174,7 @@ fn collect_func_until(
     skip_func_trash_until(end, stream)?;
 
     let once = stream
-        .next_if(|(_, ch)| *ch == FUNCTION_ONCE_EXEC_CH)
+        .next_if(|(_, ch)| *ch == FUNCTION_ONCE_EXEC_CHAR)
         .is_some();
 
     let (fn_loc, fn_name) = collect_word_until(end, stream)?;
@@ -262,33 +245,33 @@ fn collect_word_until(
     let mut word = String::new();
     let mut word_loc = None::<Loc>;
 
-    let result = loop {
+    // this will allow to collect empty string via quotes ""
+    let mut quoted_word_collected = false;
+    let break_reason = loop {
         let Some(&(loc, ch)) = stream.peek() else {
-            break Err(WordErr::EndOfStream);
+            break WordErr::EndOfStream;
         };
 
         if word_loc.is_none() {
             word_loc = Some(loc);
         }
 
-        if ch == end {
-            break Err(WordErr::ReachedDelimiter);
-        } else if ch.is_whitespace() {
-            break Ok(());
+        if ch == end || ch.is_whitespace() {
+            break WordErr::ReachedDelimiter;
         } else if ch == '"' {
-            collect_quoted_word_into(&mut word, stream)?;
-            return Ok((word_loc.unwrap(), word));
+            collect_quoted_word_into(&mut word, stream)?; // short circuit UnclosedQuotes error
+            quoted_word_collected = true;
         } else if ch == '\\' {
             let _ = stream.next();
             let Some((_, next_ch)) = stream.next() else {
-                break Err(WordErr::EndOfStream);
+                break WordErr::EndOfStream;
             };
 
             word.push(next_ch);
-        } else if ch == FUNCTION_COMMENT_CH {
+        } else if ch == FUNCTION_COMMENT_CHAR {
             let _ = stream.next();
             if let Err(e) = skip_comment_until(end, stream) {
-                break Err(e);
+                break e;
             }
         } else {
             let _ = stream.next();
@@ -296,14 +279,10 @@ fn collect_word_until(
         }
     };
 
-    if word.is_empty() {
-        let Err(e) = result else {
-            unreachable!();
-        };
-
-        Err(e)
-    } else {
+    if quoted_word_collected || !word.is_empty() {
         Ok((word_loc.unwrap(), word))
+    } else {
+        Err(break_reason)
     }
 }
 
@@ -327,27 +306,24 @@ fn collect_phrase_into(
 }
 
 fn collect_indent(stream: &mut Peekable<impl Iterator<Item = (Loc, char)>>) -> Option<Indentation> {
-    let mut amount = 0;
-    let (_, ch) = stream.peek().copied()?;
+    let mut depth = 0;
+    let (_, kind) = stream.peek().copied()?;
 
-    let mut indent = match ch {
-        ' ' => Indentation::Spaces(0),
-        '\t' => Indentation::Tabs(0),
-        _ => return Some(Indentation::empty()),
-    };
-
-    while stream.next_if(|t| t.1 == ch).is_some() {
-        amount += 1;
+    if !(kind == SPACE || kind == TAB) {
+        return Some(Indentation::empty());
     }
 
-    *indent.get_mut_amount() = amount;
+    while stream.next_if(|t| t.1 == kind).is_some() {
+        depth += 1;
+    }
 
-    Some(indent)
+    Some(Indentation { kind, depth })
 }
 
 pub(super) fn tokenize(module_name: &str, src: &str) -> Result<Vec<Token>, ()> {
     let mut tokens = Vec::new();
     let mut loc = Loc { line: 1, col: 1 };
+    let mut failed = false;
 
     let mut stream = src
         .chars()
@@ -376,21 +352,20 @@ pub(super) fn tokenize(module_name: &str, src: &str) -> Result<Vec<Token>, ()> {
         };
 
         let token = match ch {
-            FUNCTION_CH if stream.peek().is_some_and(|(_, next_ch)| *next_ch != '{') => {
-                let Ok((fn_loc, once, fn_name, args)) = collect_func_until('\n', &mut stream)
-                else {
-                    continue;
-                };
-
-                let kind = FunctionKind::from_str(&fn_name);
-                Some((fn_loc, TokenKind::Function { kind, args, once }))
+            FUNCTION_CHAR if stream.peek().is_some_and(|(_, next_ch)| *next_ch != '{') => {
+                if let Ok((fn_loc, once, fn_name, args)) = collect_func_until('\n', &mut stream) {
+                    let kind = FunctionKind::from_str(&fn_name);
+                    Some((fn_loc, TokenKind::Function { kind, args, once }))
+                } else {
+                    Some((ch_loc, TokenKind::Comment))
+                }
             }
-            OPTION_CH => {
+            OPTION_CHAR => {
                 let mut phrase = String::new();
                 collect_phrase_into(&mut phrase, &mut stream)
                     .map(|_| (ch_loc, TokenKind::Choice(phrase)))
             }
-            RESPONSE_CH => {
+            RESPONSE_CHAR => {
                 let mut phrase = String::new();
                 collect_phrase_into(&mut phrase, &mut stream)
                     .map(|_| (ch_loc, TokenKind::Response(phrase)))
@@ -415,6 +390,9 @@ pub(super) fn tokenize(module_name: &str, src: &str) -> Result<Vec<Token>, ()> {
                     eprintln!(
                         "{module_name}:{ch_loc} this text must belong to `-` response or `>` choice"
                     );
+
+                    failed = true;
+                    // skip err line as if it was a comment ahhahahha
                     if let Err(WordErr::EndOfStream) = skip_comment_until('\n', &mut stream) {
                         break;
                     }
@@ -422,8 +400,8 @@ pub(super) fn tokenize(module_name: &str, src: &str) -> Result<Vec<Token>, ()> {
                     continue;
                 };
 
-                for _ in 0..indentation.get_amount() {
-                    p.push(indentation.as_char())
+                for _ in 0..indentation.depth {
+                    p.push(indentation.kind)
                 }
 
                 p.push(ch);
@@ -445,25 +423,18 @@ pub(super) fn tokenize(module_name: &str, src: &str) -> Result<Vec<Token>, ()> {
         });
     }
 
-    Ok(tokens)
+    if failed { Err(()) } else { Ok(tokens) }
 }
 
 #[derive(Debug)]
 pub(super) enum Item {
-    Nop,
     End,
-    Block {
-        guards_choices: bool,
-        next: Option<usize>, // links will hold an item after the block to be able to `#hide` them all
-    },
     Response {
         phrase: Phrase,
         choices: Vec<usize>,
     },
     Choice {
-        conditions: Vec<usize>,
         phrase: Phrase,
-        display: bool, // all conditions returned true
     },
     Jump {
         once: bool,
@@ -481,25 +452,68 @@ pub(super) enum Item {
         func_data: FuncData,
         func: usize,
     },
-    If {
-        func_data: FuncData,
-        func: usize,
-
+    Block {
+        guarded_choices: Option<Vec<usize>>,
         next: Option<usize>,
-        guards_choices: bool,
+        kind: BlockKind,
     },
-    // Elif { condition_fn: usize },
-    // Else { condition_fn: usize },
 }
 
 #[derive(Debug)]
-pub struct FuncData {
-    pub once: bool,
-    pub call_location: Loc,
-    pub args: Vec<String>,
+pub(super) enum Condition {
+    AlwaysShown,
+    AlwaysHidden,
+    Check(usize, FuncData, Option<usize>),
 }
 
-pub(super) type Func<State, Ret> = dyn Fn(&mut State, &FuncData) -> Ret;
+#[derive(Debug)]
+pub(super) struct ItemVIsibility {
+    pub(super) manual: bool,
+    pub(super) condition: Condition,
+}
+
+impl Default for ItemVIsibility {
+    fn default() -> Self {
+        Self {
+            manual: true,
+            condition: Condition::AlwaysShown,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum BlockKind {
+    If,
+    Elif, // 'elif' without condition is basically 'else'
+    LabeledBlock,
+}
+
+#[derive(Debug)]
+pub(super) struct FuncData {
+    pub(super) once: bool,
+    pub(super) call_location: Loc,
+    pub(super) args: Vec<String>,
+}
+
+impl FuncData {
+    pub(super) fn as_context<'a, State>(&'a self, state: &'a mut State) -> Context<'a, State> {
+        Context {
+            state,
+            args: &self.args,
+            call_location: self.call_location,
+            once: self.once,
+        }
+    }
+}
+
+pub struct Context<'a, State> {
+    pub state: &'a mut State,
+    pub args: &'a [String],
+    pub call_location: Loc,
+    pub once: bool,
+}
+
+pub(super) type Func<State, Ret> = dyn Fn(Context<State>) -> Ret;
 
 pub enum Function<State> {
     Bool(Box<Func<State, bool>>),
@@ -508,16 +522,16 @@ pub enum Function<State> {
 }
 
 impl<State> Function<State> {
-    pub(super) fn call_drop(&self, state: &mut State, func_data: &FuncData) {
+    pub(super) fn call_drop(&self, ctx: Context<State>) {
         match self {
             Function::String(f) => {
-                f(state, func_data);
+                f(ctx);
             }
             Function::Bool(f) => {
-                f(state, func_data);
+                f(ctx);
             }
             Function::Nothing(f) => {
-                f(state, func_data);
+                f(ctx);
             }
         }
     }
@@ -530,7 +544,7 @@ pub trait IntoFunction<State, T> {
 
 impl<State, F> IntoFunction<State, ()> for F
 where
-    F: Fn(&mut State, &FuncData) + 'static,
+    F: Fn(Context<State>) + 'static,
 {
     fn into_function(self) -> Function<State> {
         Function::Nothing(Box::new(self))
@@ -538,7 +552,7 @@ where
 }
 impl<State, F> IntoFunction<State, String> for F
 where
-    F: Fn(&mut State, &FuncData) -> String + 'static,
+    F: Fn(Context<State>) -> String + 'static,
 {
     fn into_function(self) -> Function<State> {
         Function::String(Box::new(self))
@@ -547,15 +561,21 @@ where
 
 impl<State, F> IntoFunction<State, bool> for F
 where
-    F: Fn(&mut State, &FuncData) -> bool + 'static,
+    F: Fn(Context<State>) -> bool + 'static,
 {
     fn into_function(self) -> Function<State> {
         Function::Bool(Box::new(self))
     }
 }
 
+impl<State, T> IntoFunction<State, T>  for Function<State> {
+    fn into_function(self) -> Function<State> {
+        self
+    }
+}
+
 #[derive(Default)]
-struct ParserData {
+struct Parser {
     single_indentation: Indentation,
     labels_map: HashMap<String, usize>,
     label_jumps: HashMap<usize, (Loc, String)>, // to store all jumps, before all labels are defined
@@ -568,6 +588,7 @@ struct ParserData {
     // Result
     items: Vec<Item>,
     links: Vec<Option<usize>>,
+    vis: Vec<ItemVIsibility>,
     failed: bool,
 }
 
@@ -575,29 +596,22 @@ struct ParserData {
 pub(super) fn parse_tokens_into_items<State>(
     main_module: &str,
     tokens: Vec<Token>,
-    funcs_map_defs: HashMap<&'static str, Function<State>>,
-) -> Result<(Vec<Item>, Vec<Option<usize>>, Vec<Function<State>>), ()> {
-    let mut parser = ParserData::default();
-    let mut funcs = Vec::new();
-    let mut funcs_map = HashMap::new();
-
-    for (fn_name, func) in funcs_map_defs {
-        funcs_map.insert(fn_name, funcs.len());
-        funcs.push(func);
-    }
+    funcs_map: &FunctionMap<State>,
+) -> Result<(Vec<Item>, Vec<ItemVIsibility>, Vec<Option<usize>>), ()> {
+    let mut parser = Parser::default();
 
     // TODO: avoid second allocation for the name
     parser.modules.insert(main_module.into(), true);
     parser.load_queue.push((main_module.into(), tokens));
 
     while !parser.load_queue.is_empty() {
-        parse_module(&mut parser, &funcs_map, &funcs);
+        parse_module(&mut parser, funcs_map);
     }
 
     for (module, imports) in parser.local_imports {
         for (imp, (loc, is_used)) in imports {
             if !is_used {
-                eprintln!("{loc} in `{module}` import `{imp}` was never referensed anywhere");
+                eprintln!("{module}:{loc} import `{imp}` was never referensed anywhere");
                 parser.failed = true;
             }
         }
@@ -613,8 +627,8 @@ pub(super) fn parse_tokens_into_items<State>(
         };
 
         if let Item::Choice { .. }
-        | Item::If {
-            guards_choices: true,
+        | Item::Block {
+            guarded_choices: Some(_),
             ..
         } = parser.items[target_item]
         {
@@ -657,12 +671,12 @@ pub(super) fn parse_tokens_into_items<State>(
     if parser.failed {
         Err(())
     } else {
-        Ok((parser.items, parser.links, funcs))
+        Ok((parser.items, parser.vis, parser.links))
     }
 }
 
 fn parse_module<State>(
-    ParserData {
+    Parser {
         load_queue,
         modules,
         local_imports,
@@ -672,10 +686,10 @@ fn parse_module<State>(
         label_vis_changes,
         items,
         links,
+        vis,
         failed,
-    }: &mut ParserData,
-    funcs_map: &HashMap<&'static str, usize>,
-    funcs: &[Function<State>],
+    }: &mut Parser,
+    funcs_map: &FunctionMap<State>,
 ) {
     macro_rules! fail {
         () => {{
@@ -695,8 +709,8 @@ fn parse_module<State>(
     let make_label = |m: &str, l: &str| m.to_owned() + "." + l;
 
     let mut get_depth = |indent: Indentation, loc: Loc| -> Result<u32, ()> {
-        if single_indentation.is_empty() {
-            if indent.is_empty() {
+        if single_indentation.depth == 0 {
+            if indent.depth == 0 {
                 return Ok(0);
             }
 
@@ -717,12 +731,16 @@ fn parse_module<State>(
     let mut sibling_idx = Vec::<u32>::new();
     let mut item_depth = Vec::<u32>::new();
     let mut item_loc = Vec::<Loc>::new();
+    let mut item_vis = Vec::<ItemVIsibility>::new();
 
     let mut module_items = Vec::<Item>::new();
     let mut label_to_assign = None::<String>;
-    let mut tokens = tokens.into_iter().peekable();
+    let mut tokens = tokens
+        .into_iter()
+        .filter(|t| !matches!(t.kind, TokenKind::Comment))
+        .peekable();
 
-    while let Some(token) = tokens.next() {
+    'parsing_loop: while let Some(token) = tokens.next() {
         let this_item = module_items.len() + link_offset;
         let token_loc = token.loc;
 
@@ -739,6 +757,7 @@ fn parse_module<State>(
 
                 item_depth.push(token_depth);
                 item_loc.push(token_loc);
+                item_vis.push(ItemVIsibility::default());
 
                 if $update_family {
                     let this = module_items.len();
@@ -755,9 +774,10 @@ fn parse_module<State>(
         }
 
         match token.kind {
+            TokenKind::Comment => unreachable!(),
             TokenKind::Response(phrase) => {
                 // phrase phrase phrase phrase phrase phrase
-                let phrase = parse_phrase(&module_name, (token_loc, &phrase), funcs_map, funcs)
+                let phrase = parse_phrase(&module_name, (token_loc, &phrase), funcs_map)
                     .unwrap_or_else(|_| {
                         fail!();
                         Phrase::Static(phrase)
@@ -772,7 +792,7 @@ fn parse_module<State>(
                 );
             }
             TokenKind::Choice(phrase) => {
-                let phrase = parse_phrase(&module_name, (token_loc, &phrase), funcs_map, funcs)
+                let phrase = parse_phrase(&module_name, (token_loc, &phrase), funcs_map)
                     .unwrap_or_else(|_| {
                         fail!();
                         Phrase::Static(phrase)
@@ -781,30 +801,40 @@ fn parse_module<State>(
                 register_state_item!(false);
 
                 let mut search_depth = item_depth[this_item];
-                let mut conditions = Vec::<usize>::new();
+                let mut choice_idx_to_push = Some(this_item);
 
                 let handler_search_result = (0..module_items.len()).rev().find_map(|prev_item| {
-                    if let Item::Block { guards_choices, .. } | Item::If { guards_choices, .. } =
-                        &mut module_items[prev_item]
+                    let prev_item_depth = item_depth[prev_item];
+                    if let Item::Block {
+                        guarded_choices,
+                        kind,
+                        ..
+                    } = &mut module_items[prev_item]
                     {
-                        if token_depth < item_depth[prev_item] {
+                        if search_depth < prev_item_depth {
                             return None;
-                        } else if token_depth == item_depth[prev_item] && prev_item + 1 != this_item
-                        {
-                            if !*guards_choices {
+                        } else if search_depth == prev_item_depth && prev_item + 1 != this_item {
+                            if guarded_choices.is_none() {
                                 return Some(Err(()));
                             }
 
                             return None;
                         }
 
-                        *guards_choices = true;
-                        conditions.push(prev_item);
-                        search_depth = item_depth[prev_item];
+                        guarded_choices.get_or_insert_default().push(this_item);
+
+                        // TODO: this may be overwritten??
+                        choice_idx_to_push = if matches!(kind, BlockKind::Elif) {
+                            None
+                        } else {
+                            Some(prev_item)
+                        };
+
+                        search_depth = prev_item_depth;
                         None
-                    } else if item_depth[prev_item] < search_depth {
+                    } else if prev_item_depth < search_depth {
                         Some(Err(()))
-                    } else if item_depth[prev_item] > search_depth {
+                    } else if prev_item_depth > search_depth {
                         None
                     } else if let Item::Choice { .. } = &module_items[prev_item] {
                         None
@@ -813,11 +843,13 @@ fn parse_module<State>(
                     }
                 });
 
+                module_items.push(Item::Choice { phrase });
+
                 let opt_handler = match handler_search_result {
                     Some(Ok(h)) => h,
                     Some(Err(())) | None => {
                         fail!(
-                            "{module_name}:{token_loc} couldn't find an option handler for {phrase:?} on this depth"
+                            "{module_name}:{token_loc} couldn't find a response for this choice on this depth"
                         );
                         continue;
                     }
@@ -825,14 +857,11 @@ fn parse_module<State>(
 
                 sibling_idx.push(sibling_idx[opt_handler]);
                 parents.push(Some(opt_handler));
-                module_items.push(Item::Choice {
-                    conditions,
-                    phrase,
-                    display: true,
-                });
 
                 if let Item::Response { choices, .. } = &mut module_items[opt_handler] {
-                    choices.push(this_item);
+                    if let Some(idx) = choice_idx_to_push {
+                        choices.push(idx);
+                    }
                 } else {
                     fail!(
                         "{module_name}:{token_loc} options can only belong to responses, defined with `-`"
@@ -937,9 +966,7 @@ fn parse_module<State>(
 
                 if !args.is_empty() {
                     let (loc, _) = args[1];
-                    fail!(
-                        "{module_name}:{loc} too many arguments for `{kind}` function, expected only one label"
-                    );
+                    fail!("{module_name}:{loc} `{kind}` doesn't expect any arguments");
                 }
 
                 register_state_item!(true, Item::End);
@@ -1001,8 +1028,9 @@ fn parse_module<State>(
                     register_state_item!(
                         true,
                         Item::Block {
-                            guards_choices: false,
-                            next: None
+                            kind: BlockKind::LabeledBlock,
+                            guarded_choices: None,
+                            next: None,
                         }
                     );
                 }
@@ -1096,82 +1124,131 @@ fn parse_module<State>(
                 }
             }
             TokenKind::Function {
-                kind: kind @ FunctionKind::If,
+                kind: kind @ (FunctionKind::If | FunctionKind::Elif | FunctionKind::Else),
                 args,
                 once,
             } => {
-                let Some((fn_loc, fn_name)) = args.first() else {
-                    fail!(
-                        "{module_name}:{token_loc} expected condition function name for `{kind}`"
-                    );
-                    continue;
+                let (cond_kind, check) = if let FunctionKind::If | FunctionKind::Elif = kind {
+                    if once {
+                        fail!(
+                            "{module_name}:{token_loc} `{kind}` is compile time function, it doesn't support `once` evaluation. You may want to make the condition function `once`: '#if !condition ...'"
+                        )
+                    }
+
+                    let mut args = args.into_iter();
+                    let mut once = false;
+                    let mut func = None::<usize>;
+
+                    for (fn_loc, fn_name) in args.by_ref() {
+                        if fn_name.as_str() == "!" {
+                            once = true;
+                            continue;
+                        }
+
+                        let Some(&func_idx) = funcs_map.indices.get(fn_name.as_str()) else {
+                            fail!("{module_name}:{fn_loc} function `{fn_name}` is undefined");
+                            continue 'parsing_loop;
+                        };
+
+                        if !matches!(&funcs_map.funcs[func_idx], Function::Bool(_)) {
+                            fail!(
+                                "{module_name}:{fn_loc} function `{fn_name}` must return boolean value for `{kind}`"
+                            );
+                            continue 'parsing_loop;
+                        }
+
+                        func = Some(func_idx);
+                        break;
+                    }
+
+                    let Some(func) = func else {
+                        fail!(
+                            "{module_name}:{token_loc} expected condition function name for `{kind}`"
+                        );
+                        continue;
+                    };
+
+                    let args = args.map(|(_, a)| a).collect::<Vec<String>>();
+
+                    let func_data = FuncData {
+                        once,
+                        args,
+                        call_location: token_loc,
+                    };
+
+                    let cond_kind = match kind {
+                        FunctionKind::If => BlockKind::If,
+                        FunctionKind::Elif => BlockKind::Elif,
+                        _ => unreachable!(),
+                    };
+
+                    (cond_kind, Condition::Check(func, func_data, None))
+                } else {
+                    if let Some((arg_loc, _)) = args.first() {
+                        fail!("{module_name}:{arg_loc} `{kind}` doesn't expect any arguments");
+                        continue;
+                    }
+
+                    (BlockKind::Elif, Condition::AlwaysShown)
                 };
 
-                let Some(func) = funcs_map.get(fn_name.as_str()).copied() else {
-                    fail!("{module_name}:{fn_loc} function `{fn_name}` is undefined");
-                    continue;
-                };
+                if let BlockKind::Elif = cond_kind {
+                    // TODO: this is better than with sibling_idx? and it is the same as for Kind::Choice search
+                    let Some(Ok(prev_sibling)) =
+                        (0..module_items.len()).rev().find_map(|prev_item| {
+                            if token_depth > item_depth[prev_item] {
+                                Some(Err(()))
+                            } else if token_depth < item_depth[prev_item] {
+                                None
+                            } else if let Item::Choice { .. } = &module_items[prev_item] {
+                                None
+                            } else {
+                                Some(Ok(prev_item))
+                            }
+                        })
+                    else {
+                        fail!(
+                            "{module_name}:{token_loc} couldn't find condition start for this `{kind}`"
+                        );
+                        continue;
+                    };
 
-                if !matches!(&funcs[func], Function::Bool(_)) {
-                    fail!(
-                        "{module_name}:{fn_loc} function `{fn_name}` must return boolean value for `{kind}`"
-                    );
-                    continue;
+                    if let Condition::Check(.., fallback_condition) =
+                        &mut item_vis[prev_sibling].condition
+                    {
+                        *fallback_condition = Some(this_item);
+                    } else if let Some(Condition::Check(.., fallback_condition)) = prev_sibling
+                        .checked_sub(1)
+                        .map(|it| &mut item_vis[it].condition)
+                    {
+                        *fallback_condition = Some(this_item);
+                    } else {
+                        fail!(
+                            "{module_name}:{token_loc} couldn't find condition start for this `{kind}`"
+                        );
+                        continue;
+                    }
                 }
 
-                let Some(next_t) = tokens.peek() else {
-                    fail!("{module_name}:{token_loc} `{kind}` doesn't hold any items");
-                    continue;
-                };
-
-                let guards_choices = matches!(
-                    next_t,
-                    Token {
-                        kind: TokenKind::Choice(_),
-                        ..
-                    }
-                );
-
-                // let Ok(next_t_depth) = get_depth(next_t.indentation, next_t.loc) else {
-                //     fail!();
-                //     return;
-                // };
-
-                // if next_t_depth == token_depth {
-                //     fail!(
-                //         "{module_name}:{token_loc} `{kind}` must hold at least one item indented under it"
-                //     );
-                //     continue;
-                // }
-
-                let args = args
-                    .into_iter()
-                    .skip(1)
-                    .map(|(_, a)| a)
-                    .collect::<Vec<String>>();
-
-                let func_data = FuncData {
-                    once,
-                    args,
-                    call_location: token_loc,
-                };
+                // TODO: this is not need to be block if holds only one item (defined with the same indentation)
 
                 register_state_item!(
                     true,
-                    Item::If {
-                        guards_choices,
-                        func,
-                        func_data,
+                    Item::Block {
+                        kind: cond_kind,
+                        guarded_choices: None,
                         next: None,
                     }
                 );
+
+                item_vis[this_item].condition = check;
             }
             TokenKind::Function {
                 kind: FunctionKind::Custom(fn_name),
                 args,
                 once,
             } => {
-                let Some(func) = funcs_map.get(fn_name.as_str()).copied() else {
+                let Some(func) = funcs_map.indices.get(fn_name.as_str()).copied() else {
                     fail!("{module_name}:{token_loc} function `{fn_name}` is undefined",);
                     continue;
                 };
@@ -1191,47 +1268,102 @@ fn parse_module<State>(
 
     let items_len = module_items.len();
     for this_item in 0..items_len {
-        let (Item::Block {
-            guards_choices: true,
+        let Item::Block {
+            guarded_choices,
+            kind,
             ..
-        }
-        | Item::If {
-            guards_choices: true,
-            ..
-        }) = &module_items[this_item]
+        } = &module_items[this_item]
         else {
             continue;
         };
 
-        for next_item in this_item + 1..items_len {
-            if item_depth[next_item] <= item_depth[this_item] {
-                break;
-            }
+        let guards_choices = guarded_choices.is_some();
+        let next_item = this_item + 1;
 
-            if !matches!(&module_items[next_item], Item::Choice { .. }) {
-                fail!(
-                    "{module_name}:{loc} block that starts with choice at {block_start_loc} must hold only choices",
-                    loc = item_loc[next_item],
-                    block_start_loc = item_loc[this_item + 1]
-                );
+        if module_items.get(next_item).is_none_or(|_| {
+            item_depth[next_item] < item_depth[this_item]
+                || (item_depth[next_item] == item_depth[this_item]
+                    && matches!(&item_vis[next_item].condition, Condition::Check(..)))
+        }) {
+            fail!(
+                "{module_name}:{loc} condition doesn't contain any item",
+                loc = item_loc[this_item],
+            )
+        }
+
+        if guarded_choices.is_some() {
+            for next_item in this_item + 1..items_len {
+                if item_depth[next_item] <= item_depth[this_item] {
+                    break;
+                }
+
+                if !matches!(&module_items[next_item], Item::Choice { .. }) {
+                    fail!(
+                        "{module_name}:{loc} block that starts with choice at {block_start_loc} must hold only choices",
+                        loc = item_loc[next_item],
+                        block_start_loc = item_loc[this_item]
+                    );
+                }
             }
         }
+
+        let (BlockKind::If, Condition::Check(.., fallback_condition)) =
+            (kind, &item_vis[this_item].condition)
+        else {
+            continue;
+        };
+
+        let mut next_condition = *fallback_condition;
+        while let Some(cond_item) = next_condition {
+            let Item::Block {
+                guarded_choices: fallback_choices,
+                ..
+            } = &module_items[cond_item]
+            else {
+                unreachable!();
+            };
+
+            if guards_choices != fallback_choices.is_some() {
+                let ttype = if guards_choices {
+                    "guard choices"
+                } else {
+                    "hold state items"
+                };
+                fail!(
+                    "{module_name}:{loc} this condition branch doesn't {ttype} as it's 'if' at {if_start_loc}",
+                    loc = item_loc[cond_item],
+                    if_start_loc = item_loc[this_item]
+                )
+            }
+
+            if let Condition::Check(.., fallback_condition) = &mut item_vis[cond_item].condition {
+                next_condition = *fallback_condition;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if *failed {
+        return;
     }
 
     let module_links = link_state_items(
         link_offset,
         &mut module_items,
         &item_depth,
+        &item_vis,
         &parents,
         &sibling_idx,
     );
 
     links.extend(module_links);
     items.extend(module_items);
+    vis.extend(item_vis);
 }
 
 #[derive(Debug)]
-pub(crate) enum Phrase {
+pub(super) enum Phrase {
     Static(String),
     Dynamic {
         buffer: String,
@@ -1269,7 +1401,7 @@ impl Phrase {
                         unreachable!();
                     };
 
-                    let output = f(state, func_data);
+                    let output = f(func_data.as_context(state));
                     let _ = write!(buffer, "{output}");
 
                     if func_data.once {
@@ -1286,7 +1418,7 @@ impl Phrase {
 }
 
 #[derive(Debug)]
-pub(crate) enum PhraseParts {
+pub(super) enum PhraseParts {
     Static(String),
     FromFunction { func: usize, func_data: FuncData },
 }
@@ -1294,8 +1426,7 @@ pub(crate) enum PhraseParts {
 fn parse_phrase<State>(
     module_name: &str,
     (mut phrase_loc, input): (Loc, &str),
-    funcs_map: &HashMap<&'static str, usize>,
-    funcs: &[Function<State>],
+    funcs_map: &FunctionMap<State>,
 ) -> Result<Phrase, ()> {
     let mut failed = false;
     let mut parts = Vec::<PhraseParts>::new();
@@ -1328,7 +1459,7 @@ fn parse_phrase<State>(
 
             buf.push(next_ch);
             continue;
-        } else if ch != FUNCTION_CH {
+        } else if ch != FUNCTION_CHAR {
             buf.push(ch);
             continue;
         }
@@ -1371,7 +1502,7 @@ fn parse_phrase<State>(
             continue;
         };
 
-        let Some(func) = funcs_map.get(fn_name.as_str()).copied() else {
+        let Some(func) = funcs_map.indices.get(fn_name.as_str()).copied() else {
             eprintln!("{func_loc} function `{fn_name}` is undefined");
             failed = true;
             continue;
@@ -1389,7 +1520,7 @@ fn parse_phrase<State>(
             call_location: func_loc,
         };
 
-        if !matches!(funcs[func], Function::String(_)) {
+        if !matches!(&funcs_map.funcs[func], Function::String(_)) {
             eprintln!("{func_loc} function doesn't return a displayable value");
             failed = true;
             continue;
@@ -1465,6 +1596,7 @@ fn link_state_items(
     link_offset: usize,
     items: &mut [Item],
     item_depth: &[u32],
+    item_vis: &[ItemVIsibility],
     parents: &[Option<usize>],
     sibling_idx: &[u32],
 ) -> Vec<Option<usize>> {
@@ -1476,11 +1608,11 @@ fn link_state_items(
         if let Item::Choice { .. }
         | Item::End
         | Item::Block {
-            guards_choices: true,
+            guarded_choices: Some(_),
             ..
         }
-        | Item::If {
-            guards_choices: true,
+        | Item::Block {
+            kind: BlockKind::Elif,
             ..
         } = &items[item]
         {
@@ -1492,16 +1624,13 @@ fn link_state_items(
             .checked_sub(1)
             .filter(|prev_item| !matches!(items[*prev_item], Item::End))
         {
-            let link =
-                if let Item::If { next, .. } | Item::Block { next, .. } = &mut items[prev_item] {
-                    next
-                } else if let link @ None = &mut links[prev_item] {
-                    link
-                } else {
-                    continue;
-                };
+            let link = Some(item + link_offset);
 
-            *link = Some(item + link_offset);
+            if let Item::Block { next, .. } = &mut items[prev_item] {
+                *next = link;
+            } else if let prev_link @ None = &mut links[prev_item] {
+                *prev_link = link;
+            };
         }
 
         states.push(item);
@@ -1510,28 +1639,35 @@ fn link_state_items(
     for i in 0..states.len() {
         let this_state = states[i];
 
-        let (states_search_range, maybe_options) = match &items[this_state] {
-            Item::Response { choices, .. } => (&states[i..], Some(choices)),
-            Item::If { .. } => (&states[i + 1..], None),
-            Item::Block { .. }
-            | Item::Nop
-            | Item::FunctionCall { .. }
+        let (search_start, maybe_options) = match &items[this_state] {
+            Item::Response { choices, .. } => (i, Some(choices)),
+            Item::Block { .. } => {
+                // TODO: if it is a single item block don't push the Block item lol
+                let start = if item_depth[this_state] == item_depth[this_state + 1] {
+                    i + 1
+                } else {
+                    i
+                };
+
+                (start, None)
+            }
+            Item::FunctionCall { .. }
             | Item::Jump { .. }
             | Item::Hide { .. }
-            | Item::Show { .. } => (&states[i..], None),
+            | Item::Show { .. } => (i, None),
             Item::End | Item::Choice { .. } => unreachable!(),
         };
 
         if links[this_state].is_some()
             && (maybe_options.is_none()
-                || maybe_options.is_some_and(|opts| opts.iter().all(|o| links[*o].is_some())))
+                || maybe_options.is_some_and(|opts| opts.iter().all(|&o| links[o].is_some())))
         {
             continue;
         }
 
         let found_next_item = find_next_state_long_long_way(
-            this_state,
-            states_search_range,
+            &states[search_start..],
+            items,
             parents,
             sibling_idx,
             item_depth,
@@ -1540,6 +1676,26 @@ fn link_state_items(
 
         if let link @ None = &mut links[this_state] {
             *link = found_next_item;
+        }
+
+        if let Item::Block {
+            kind: BlockKind::If,
+            ..
+        } = &items[this_state]
+            && let Condition::Check(.., fallback_condition) = &item_vis[this_state].condition
+        {
+            let mut next_condition = *fallback_condition;
+            while let Some(cond_item) = next_condition {
+                let cond_link = &mut links[cond_item];
+                assert!(cond_link.is_none(), "{cond_link:?}");
+                *cond_link = found_next_item;
+
+                if let Condition::Check(.., fallback_condition) = &item_vis[cond_item].condition {
+                    next_condition = *fallback_condition;
+                } else {
+                    break;
+                }
+            }
         }
 
         let Some(options) = maybe_options else {
@@ -1563,9 +1719,7 @@ fn get_depth_from_indent(
     single_indent: Indentation,
     loc: Loc,
 ) -> Result<u32, ()> {
-    if let (Indentation::Spaces(_), Indentation::Tabs(_))
-    | (Indentation::Tabs(_), Indentation::Spaces(_)) = (indentation, &single_indent)
-    {
+    if let (SPACE, TAB) | (TAB, SPACE) = (indentation.kind, single_indent.kind) {
         eprintln!(
             "{loc} got {} instead of {}",
             indentation.as_str_name(),
@@ -1574,8 +1728,8 @@ fn get_depth_from_indent(
         return Err(());
     }
 
-    let got_amount = indentation.get_amount();
-    let single_amount = single_indent.get_amount();
+    let got_amount = indentation.depth;
+    let single_amount = single_indent.depth;
     let indent = single_indent.as_str_name();
 
     if got_amount % single_amount != 0 {
@@ -1628,19 +1782,29 @@ fn welcome_to_the_family(
 }
 
 fn find_next_state_long_long_way(
-    mut current: usize,
     states: &[usize],
+    items: &[Item],
     parents: &[Option<usize>],
     sibling_idx: &[u32],
     item_depth: &[u32],
 ) -> Option<usize> {
+    let mut current = states.first().copied()?;
+
     loop {
         'searching: for state in states.iter().skip(1) {
             if item_depth[current] != item_depth[*state] {
                 continue 'searching;
             } else if sibling_idx[current] >= sibling_idx[*state] {
                 break 'searching;
-            } else if sibling_idx[current] + 1 == sibling_idx[*state] {
+            } else if sibling_idx[current] + 1 == sibling_idx[*state]
+                && !matches!(
+                    items[current],
+                    Item::Block {
+                        kind: BlockKind::Elif,
+                        ..
+                    }
+                )
+            {
                 return Some(*state);
             }
         }

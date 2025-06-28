@@ -73,7 +73,6 @@ If you want to have indentation in your text, use `\` to denote start of a new l
 ```
 - I am too tired to make something funny..
   \        < this shit is not trimmed after '\'
-  ## Hello, I am a comment in the middle of the phrase for some reason!!?!?
   \    ##   < look, this is escaped and not treated as a comment 0_0
   And I am just a casual new line without indentation..
 ```
@@ -104,16 +103,15 @@ fn complain(my_state: &mut MyState, d: FuncData) {
     my_state.psychological -= 1;
 }
 
-compiler.register_function("complain_to", complain);
-// pass the map to the Conversation::load
+funcs_map.register("complain_to", complain);
 ```
 and then in *murmur* file:
 ```
-# complain_to Whore
+# complain_to whore
 ```
 This function will be executed each time it appears, but if you want a function that is executed only once, use `# !<func>` syntax:
 ```
-# !complain_to Alisa # this will be executed only once
+# !complain_to bitch # this will be executed only once
 ```
 Signatures that contain spaces must be enclosed in double quotes
 ```
@@ -173,11 +171,11 @@ Will disable/enable the specified items, causing them to be skipped. If no label
     - Somewhere near.
     #jump useful_convo
 
-
-#show where how_much
-#jump useful_convo
+> Wait.. I forgot everything..
+    #show where how_much
+    #jump useful_convo
 ```
-By indenting items under `#if` label you create a group of items that can be hidden together:
+By indenting items under `#as` label you create a group of items that can be hidden together:
 ```
 #hide label
 #as label # this whole block will be skipped
@@ -218,7 +216,9 @@ Newlines and comments are allowed within interpolation:
 } aboba
 ```
 
-- TODO: `#if <func>`, `#elif <func>` and `#else`, where `func` is your `fn(&mut YourCustomState) -> bool`.
+#### `#if <func> [args ...]`, `#elif <func> [args ...]`, `#else`
+`<func>` is your external function, that returns `bool`. `if` chains have two types: "choices guard" and "state items guard". Type is determined by the first item defined in the block. Each branch of the chain must have the same type.
+TODO: exampleeeeee
 
 - TODO: `#def <template name> [$args] <content>` defines a macro that generates *murmur* chunks. Chunk is just a string, that behaves differently, depending on the context:
 ```
